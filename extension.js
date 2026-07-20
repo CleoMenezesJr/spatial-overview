@@ -8,7 +8,7 @@ const ZOOM_IN_DURATION = 400;
 export default class SpatialWorkspaceExtension extends Extension {
   enable() {
     this._dragActive = false;
-    this._originalGetFitMode = null;
+    this._originalUpdate = null;
 
     this._dragBeginId = Main.overview.connect(
       'window-drag-begin', this._onDragBegin.bind(this));
@@ -46,7 +46,7 @@ export default class SpatialWorkspaceExtension extends Extension {
     this._dragActive = true;
     controls._workspacesDisplay?.add_style_class_name('drag-active');
 
-    this._overrideGetFitMode(controls);
+    this._patchUpdate(controls);
 
     const fitAdj = controls._workspacesDisplay?._fitModeAdjustment;
     if (!fitAdj)
@@ -69,7 +69,7 @@ export default class SpatialWorkspaceExtension extends Extension {
     this._dragActive = false;
     controls._workspacesDisplay?.remove_style_class_name('drag-active');
 
-    this._restoreGetFitMode(controls);
+    this._unpatchUpdate(controls);
 
     const fitAdj = controls._workspacesDisplay?._fitModeAdjustment;
     if (fitAdj)
@@ -79,25 +79,41 @@ export default class SpatialWorkspaceExtension extends Extension {
       });
   }
 
-  _overrideGetFitMode(controls) {
-    if (this._originalGetFitMode)
+  _patchUpdate(controls) {
+    if (this._originalUpdate)
       return;
 
-    this._originalGetFitMode = controls._getFitModeForState.bind(controls);
+    this._originalUpdate = controls._update.bind(controls);
+    const extension = this;
 
-    controls._getFitModeForState = (_state) => {
-      if (this._dragActive)
-        return 1; // FitMode.ALL
+    controls._update = function () {
+      const fitModeAdjustment = this._workspacesDisplay?.fitModeAdjustment;
+      const savedProp = Object.getOwnPropertyDescriptor(
+        Object.getPrototypeOf(fitModeAdjustment), 'value');
 
-      return this._originalGetFitMode(_state);
+      if (extension._dragActive && savedProp) {
+        Object.defineProperty(fitModeAdjustment, 'value', {
+          set() { /* block _update from snapping fit mode */ },
+          get() { return savedProp.get.call(this); },
+          configurable: true,
+          enumerable: true,
+        });
+      }
+
+      try {
+        extension._originalUpdate();
+      } finally {
+        if (savedProp)
+          Object.defineProperty(fitModeAdjustment, 'value', savedProp);
+      }
     };
   }
 
-  _restoreGetFitMode(controls) {
-    if (!this._originalGetFitMode)
+  _unpatchUpdate(controls) {
+    if (!this._originalUpdate)
       return;
 
-    controls._getFitModeForState = this._originalGetFitMode;
-    this._originalGetFitMode = null;
+    controls._update = this._originalUpdate;
+    this._originalUpdate = null;
   }
 }
