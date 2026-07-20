@@ -52,8 +52,8 @@ export default class SpatialWorkspaceExtension extends Extension {
       return;
 
     fitAdj.ease(1, {
-      duration: DRAG_ANIMATION_TIME,
-      mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+      duration: 500,
+      mode: Clutter.AnimationMode.EASE_OUT_BOUNCE,
     });
   }
 
@@ -94,7 +94,10 @@ export default class SpatialWorkspaceExtension extends Extension {
 
       const thumbnails = controls._thumbnailsBox;
       if (thumbnails?.should_show) {
-        thumbnails.expandFraction = 1.0;
+        thumbnails.ease_property('expand-fraction', 1.0, {
+          duration: 500,
+          mode: Clutter.AnimationMode.EASE_OUT_BOUNCE,
+        });
       }
 
       controls._updateAppDisplayVisibility?.();
