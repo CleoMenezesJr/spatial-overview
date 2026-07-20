@@ -2,12 +2,13 @@ import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import Clutter from 'gi://Clutter';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
-const DRAG_ANIMATION_TIME = 300;
+const ZOOM_OUT_DURATION = 800;
+const ZOOM_IN_DURATION = 400;
 
 export default class SpatialWorkspaceExtension extends Extension {
   enable() {
     this._dragActive = false;
-    this._originalUpdate = null;
+    this._originalGetFitMode = null;
 
     this._dragBeginId = Main.overview.connect(
       'window-drag-begin', this._onDragBegin.bind(this));
@@ -19,7 +20,7 @@ export default class SpatialWorkspaceExtension extends Extension {
 
   disable() {
     if (this._dragActive)
-      this._restoreControlsUpdate();
+      this._onDragEnd();
 
     if (this._dragBeginId) {
       Main.overview.disconnect(this._dragBeginId);
@@ -34,7 +35,6 @@ export default class SpatialWorkspaceExtension extends Extension {
       this._dragCancelledId = null;
     }
 
-    this._dragActive = false;
     Main.overview._controls?._workspacesDisplay?.remove_style_class_name('drag-active');
   }
 
@@ -44,15 +44,16 @@ export default class SpatialWorkspaceExtension extends Extension {
       return;
 
     this._dragActive = true;
-    Main.overview._controls?._workspacesDisplay?.add_style_class_name('drag-active');
-    this._overrideControlsUpdate(controls);
+    controls._workspacesDisplay?.add_style_class_name('drag-active');
+
+    this._overrideGetFitMode(controls);
 
     const fitAdj = controls._workspacesDisplay?._fitModeAdjustment;
     if (!fitAdj)
       return;
 
     fitAdj.ease(1, {
-      duration: 500,
+      duration: ZOOM_OUT_DURATION,
       mode: Clutter.AnimationMode.EASE_OUT_BOUNCE,
     });
   }
@@ -65,53 +66,38 @@ export default class SpatialWorkspaceExtension extends Extension {
     if (!controls)
       return;
 
-    this._restoreControlsUpdate();
+    this._dragActive = false;
+    controls._workspacesDisplay?.remove_style_class_name('drag-active');
+
+    this._restoreGetFitMode(controls);
 
     const fitAdj = controls._workspacesDisplay?._fitModeAdjustment;
     if (fitAdj)
       fitAdj.ease(0, {
-        duration: DRAG_ANIMATION_TIME,
+        duration: ZOOM_IN_DURATION,
         mode: Clutter.AnimationMode.EASE_OUT_QUAD,
       });
-
-    this._dragActive = false;
-    Main.overview._controls?._workspacesDisplay?.remove_style_class_name('drag-active');
   }
 
-  _overrideControlsUpdate(controls) {
-    if (this._originalUpdate)
+  _overrideGetFitMode(controls) {
+    if (this._originalGetFitMode)
       return;
 
-    this._originalUpdate = controls._update.bind(controls);
+    this._originalGetFitMode = controls._getFitModeForState.bind(controls);
 
-    controls._update = () => {
-      if (!this._dragActive) {
-        const original = this._originalUpdate;
-        this._restoreControlsUpdate();
-        original();
-        return;
-      }
+    controls._getFitModeForState = (_state) => {
+      if (this._dragActive)
+        return 1; // FitMode.ALL
 
-      const thumbnails = controls._thumbnailsBox;
-      if (thumbnails?.should_show) {
-        thumbnails.ease_property('expand-fraction', 1.0, {
-          duration: 500,
-          mode: Clutter.AnimationMode.EASE_OUT_BOUNCE,
-        });
-      }
-
-      controls._updateAppDisplayVisibility?.();
+      return this._originalGetFitMode(_state);
     };
   }
 
-  _restoreControlsUpdate() {
-    if (!this._originalUpdate)
+  _restoreGetFitMode(controls) {
+    if (!this._originalGetFitMode)
       return;
 
-    const controls = Main.overview._controls;
-    if (controls)
-      controls._update = this._originalUpdate;
-
-    this._originalUpdate = null;
+    controls._getFitModeForState = this._originalGetFitMode;
+    this._originalGetFitMode = null;
   }
 }
