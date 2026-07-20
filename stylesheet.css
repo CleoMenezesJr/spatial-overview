@@ -1,0 +1,4 @@
+/* Visual feedback during window drag — subtle workspace highlight */
+.workspaces-view.drag-active .workspace {
+  transition-duration: 250ms;
+}
