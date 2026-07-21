@@ -4,10 +4,11 @@ import St from 'gi://St';
 
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import * as DND from 'resource:///org/gnome/shell/ui/dnd.js';
 
 const ZOOM_OUT_DURATION = 500;
 const ZOOM_IN_DURATION = 350;
-const BACKDROP_OPACITY = 55;
+const BACKDROP_OPACITY = 180;
 const FIT_ALL = 1;
 const FIT_SINGLE = 0;
 
@@ -18,13 +19,16 @@ const ZoomOutView = GObject.registerClass({
 }, class ZoomOutView extends St.Widget {
     _init() {
         super._init({
-            reactive: false,
+            reactive: true,
             visible: false,
             x: 0,
             y: 0,
             x_expand: true,
             y_expand: true,
         });
+
+        this._delegate = this;
+        this._extension = null;
 
         this._progressAdj = new St.Adjustment({
             actor: this,
@@ -54,6 +58,7 @@ const ZoomOutView = GObject.registerClass({
             duration: ZOOM_IN_DURATION,
             mode: Clutter.AnimationMode.EASE_OUT_QUAD,
             onComplete: () => {
+                this._backdrop.opacity = 0;
                 this.visible = false;
             },
         });
@@ -87,18 +92,36 @@ const ZoomOutView = GObject.registerClass({
             Main.layoutManager.primaryIndex];
         return [0, mon ? mon.height : 1080];
     }
+
+    handleDragOver(source, dragActor, x, y, time) {
+        if (!this._extension)
+            return DND.DragMotionResult.CONTINUE;
+        const wsIndex = this._extension._getWorkspaceIndexAt(x, y);
+        if (wsIndex < 0)
+            return DND.DragMotionResult.CONTINUE;
+        return DND.DragMotionResult.MOVE_DROP;
+    }
+
+    acceptDrop(source, dragActor, x, y, time) {
+        if (!this._extension)
+            return false;
+        return this._extension._handleDrop(source, x, y);
+    }
 });
 
 export default class SpatialWorkspaceExtension extends Extension {
     enable() {
         this._dragActive = false;
         this._originalUpdate = null;
+        this._dragMonitor = null;
+        this._draggedMetaWindow = null;
         this._dragBeginId = null;
         this._dragEndId = null;
         this._dragCancelledId = null;
         this._progressSignalId = null;
 
         this._zoomOutView = new ZoomOutView();
+        this._zoomOutView._extension = this;
         Main.layoutManager.overviewGroup.add_child(this._zoomOutView);
 
         this._overrideThumbnailsShouldShow();
@@ -122,6 +145,12 @@ export default class SpatialWorkspaceExtension extends Extension {
     disable() {
         if (this._dragActive)
             this._onDragEnd();
+
+        if (this._dragMonitor) {
+            DND.removeDragMonitor(this._dragMonitor);
+            this._dragMonitor = null;
+        }
+        this._draggedMetaWindow = null;
 
         this._restoreThumbnailsShouldShow();
 
@@ -157,6 +186,20 @@ export default class SpatialWorkspaceExtension extends Extension {
     _onDragBegin() {
         this._dragActive = true;
 
+        this._draggedMetaWindow = null;
+        this._lastCursorX = 0;
+        this._lastCursorY = 0;
+
+        this._dragMonitor = {
+            dragMotion: (dragEvent) => {
+                this._draggedMetaWindow = dragEvent.source?.metaWindow || this._draggedMetaWindow;
+                this._lastCursorX = dragEvent.x;
+                this._lastCursorY = dragEvent.y;
+                return DND.DragMotionResult.CONTINUE;
+            },
+        };
+        DND.addDragMonitor(this._dragMonitor);
+
         const controls = this._getControls();
         if (controls) {
             this._overrideControlsUpdate(controls);
@@ -170,13 +213,28 @@ export default class SpatialWorkspaceExtension extends Extension {
             }
 
             for (const view of ws._workspacesViews ?? []) {
-                for (const w of view._workspaces ?? [])
+                for (const w of view._workspaces ?? []) {
                     w.reactive = true;
+                }
             }
         }
 
         if (this._zoomOutView)
             this._zoomOutView.show();
+    }
+
+    _handleDrop(source, x, y) {
+        const metaWindow = source?.metaWindow ?? this._draggedMetaWindow;
+        if (!metaWindow)
+            return false;
+        const wsIndex = this._getWorkspaceIndexAt(x, y);
+        if (wsIndex < 0)
+            return false;
+        const targetWs = global.workspace_manager.get_workspace_by_index(wsIndex);
+        if (metaWindow.get_workspace() === targetWs)
+            return false;
+        metaWindow.change_workspace(targetWs);
+        return true;
     }
 
     _onDragEnd() {
@@ -185,6 +243,12 @@ export default class SpatialWorkspaceExtension extends Extension {
 
         this._dragActive = false;
         this._restoreControlsUpdate();
+
+        if (this._dragMonitor) {
+            DND.removeDragMonitor(this._dragMonitor);
+            this._dragMonitor = null;
+        }
+        this._draggedMetaWindow = null;
 
         const ws = this._getWsDisplay();
         if (ws?._fitModeAdjustment) {
@@ -203,6 +267,29 @@ export default class SpatialWorkspaceExtension extends Extension {
 
         if (this._zoomOutView)
             this._zoomOutView.hide();
+    }
+
+    _getWorkspaceIndexAt(x, y) {
+        const mon = Main.layoutManager.monitors[
+            Main.layoutManager.primaryIndex];
+        if (!mon)
+            return -1;
+
+        if (x < 0 || x > mon.width)
+            return -1;
+        if (y < 0 || y > mon.height)
+            return -1;
+
+        const topBarHeight = 32;
+        if (y < topBarHeight)
+            return -1;
+
+        const nWorkspaces = global.workspace_manager.n_workspaces;
+        if (nWorkspaces === 0)
+            return -1;
+        const wsWidth = mon.width / nWorkspaces;
+        const index = Math.floor(x / wsWidth);
+        return Math.min(index, nWorkspaces - 1);
     }
 
     _overrideThumbnailsShouldShow() {
@@ -278,10 +365,12 @@ export default class SpatialWorkspaceExtension extends Extension {
         const self = this;
 
         controls._update = function () {
+            const ws = this._workspacesDisplay;
+            const fitBefore = ws?._fitModeAdjustment?.value;
+
             self._originalUpdate.call(this);
 
             if (self._dragActive) {
-                const ws = this._workspacesDisplay;
                 if (ws?._fitModeAdjustment)
                     ws._fitModeAdjustment.value = FIT_ALL;
             }
