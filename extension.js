@@ -105,7 +105,8 @@ const ZoomOutView = GObject.registerClass({
     acceptDrop(source, dragActor, x, y, time) {
         if (!this._extension)
             return false;
-        return this._extension._handleDrop(source, x, y);
+        this._extension._handleDrop(source, x, y);
+        return true;
     }
 });
 
@@ -226,15 +227,14 @@ export default class SpatialWorkspaceExtension extends Extension {
     _handleDrop(source, x, y) {
         const metaWindow = source?.metaWindow ?? this._draggedMetaWindow;
         if (!metaWindow)
-            return false;
+            return;
         const wsIndex = this._getWorkspaceIndexAt(x, y);
         if (wsIndex < 0)
-            return false;
+            return;
         const targetWs = global.workspace_manager.get_workspace_by_index(wsIndex);
         if (metaWindow.get_workspace() === targetWs)
-            return false;
+            return;
         metaWindow.change_workspace(targetWs);
-        return true;
     }
 
     _onDragEnd() {
