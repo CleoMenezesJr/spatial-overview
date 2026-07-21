@@ -1,113 +1,125 @@
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import Clutter from 'gi://Clutter';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import * as OverviewControls from 'resource:///org/gnome/shell/ui/overviewControls.js';
 
+const {APP_GRID, WINDOW_PICKER} = OverviewControls.ControlsState;
 const ZOOM_OUT_DURATION = 800;
 const ZOOM_IN_DURATION = 400;
 
 export default class SpatialWorkspaceExtension extends Extension {
   enable() {
     this._dragActive = false;
-    this._savedFitModeDesc = null;
+    this._saved = {};
 
-    this._dragBeginId = Main.overview.connect(
-      'window-drag-begin', this._onDragBegin.bind(this));
-    this._dragEndId = Main.overview.connect(
-      'window-drag-end', this._onDragEnd.bind(this));
-    this._dragCancelledId = Main.overview.connect(
-      'window-drag-cancelled', this._onDragEnd.bind(this));
+    this._ids = [
+      Main.overview.connect('window-drag-begin', this._onDragBegin.bind(this)),
+      Main.overview.connect('window-drag-end', this._onDragEnd.bind(this)),
+      Main.overview.connect('window-drag-cancelled', this._onDragEnd.bind(this)),
+    ];
   }
 
   disable() {
-    if (this._dragActive)
-      this._onDragEnd();
-
-    if (this._dragBeginId) {
-      Main.overview.disconnect(this._dragBeginId);
-      this._dragBeginId = null;
+    if (this._dragActive) {
+      const c = Main.overview._controls;
+      c?._stateAdjustment?.remove_transition('value');
+      this._restoreAll(c, c?._workspacesDisplay);
+      c?._stateAdjustment?.set({value: WINDOW_PICKER});
     }
-    if (this._dragEndId) {
-      Main.overview.disconnect(this._dragEndId);
-      this._dragEndId = null;
-    }
-    if (this._dragCancelledId) {
-      Main.overview.disconnect(this._dragCancelledId);
-      this._dragCancelledId = null;
-    }
-
+    this._ids?.forEach(id => Main.overview.disconnect(id));
+    this._ids = null;
     Main.overview._controls?._workspacesDisplay?.remove_style_class_name('drag-active');
   }
 
   _onDragBegin() {
-    const wsDisplay = Main.overview._controls?._workspacesDisplay;
-    if (!wsDisplay)
-      return;
+    const controls = Main.overview._controls;
+    const ws = controls?._workspacesDisplay;
+    if (!controls || !ws) return;
+
+    controls._stateAdjustment?.remove_transition('value');
+    this._restoreAll(controls, ws);
 
     this._dragActive = true;
-    wsDisplay.add_style_class_name('drag-active');
+    ws.add_style_class_name('drag-active');
 
-    this._fakeFitMode(wsDisplay);
+    this._patch(controls, ws);
 
-    const fitAdj = wsDisplay._fitModeAdjustment;
-    if (!fitAdj)
-      return;
+    ws._fitModeAdjustment.connectObject('notify::value', () => {
+      for (const v of ws._workspacesViews ?? [])
+        for (const w of v?._workspaces ?? [])
+          if (w?.stateAdjustment) w.stateAdjustment.value = 1;
+    }, this);
 
-    fitAdj.ease(1, {
+    controls._stateAdjustment.ease(APP_GRID, {
       duration: ZOOM_OUT_DURATION,
-      mode: Clutter.AnimationMode.EASE_OUT_BOUNCE,
+      mode: Clutter.AnimationMode.EASE_OUT_QUAD,
     });
   }
 
   _onDragEnd() {
-    if (!this._dragActive)
-      return;
-
-    const wsDisplay = Main.overview._controls?._workspacesDisplay;
-
+    if (!this._dragActive) return;
     this._dragActive = false;
-    wsDisplay?.remove_style_class_name('drag-active');
 
-    this._unfakeFitMode(wsDisplay);
+    const controls = Main.overview._controls;
+    const ws = controls?._workspacesDisplay;
 
-    const fitAdj = wsDisplay?._fitModeAdjustment;
-    if (fitAdj)
-      fitAdj.ease(0, {
-        duration: ZOOM_IN_DURATION,
-        mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-      });
-  }
+    ws?.remove_style_class_name('drag-active');
+    ws?._fitModeAdjustment?.disconnectObject(this);
 
-  _fakeFitMode(wsDisplay) {
-    if (this._savedFitModeDesc)
-      return;
+    this._restoreSideEffects(controls);
 
-    const realAdj = wsDisplay._fitModeAdjustment;
-
-    // Proxy that always reports value = 1 (ALL) to _update()
-    const fakeAdj = Object.create(realAdj);
-    Object.defineProperty(fakeAdj, 'value', {
-      get: () => 1,
-      set: () => { /* _update() tries to snap → ignore */ },
-      configurable: true,
-      enumerable: true,
-    });
-
-    // Replace the public getter so _update() reads the fake
-    this._savedFitModeDesc =
-      Object.getOwnPropertyDescriptor(wsDisplay, 'fitModeAdjustment');
-
-    Object.defineProperty(wsDisplay, 'fitModeAdjustment', {
-      get: () => fakeAdj,
-      configurable: true,
-      enumerable: true,
+    controls?._stateAdjustment?.ease(WINDOW_PICKER, {
+      duration: ZOOM_IN_DURATION,
+      mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+      onComplete: () => this._restoreComputeBox(controls),
     });
   }
 
-  _unfakeFitMode(wsDisplay) {
-    if (!this._savedFitModeDesc || !wsDisplay)
-      return;
+  _patch(controls, ws) {
+    this._saved = {};
 
-    Object.defineProperty(wsDisplay, 'fitModeAdjustment', this._savedFitModeDesc);
-    this._savedFitModeDesc = null;
+    const layout = controls.layout_manager;
+    if (layout?._computeWorkspacesBoxForState) {
+      const orig = layout._computeWorkspacesBoxForState.bind(layout);
+      this._saved.computeBox = {obj: layout, fn: orig};
+      layout._computeWorkspacesBoxForState = (state, ...args) =>
+        state === APP_GRID ? orig(WINDOW_PICKER, ...args) : orig(state, ...args);
+    }
+
+    if (controls._updateAppDisplayVisibility) {
+      this._saved.appVis = controls._updateAppDisplayVisibility.bind(controls);
+      controls._updateAppDisplayVisibility = () => {};
+    }
+
+    if (controls.showPage) {
+      this._saved.showPage = controls.showPage.bind(controls);
+      controls.showPage = () => {};
+    }
+  }
+
+  _restoreSideEffects(c) {
+    if (this._saved.appVis && c) {
+      c._updateAppDisplayVisibility = this._saved.appVis;
+      delete this._saved.appVis;
+    }
+    if (this._saved.showPage && c) {
+      c.showPage = this._saved.showPage;
+      delete this._saved.showPage;
+    }
+  }
+
+  _restoreComputeBox(c) {
+    if (this._saved.computeBox) {
+      this._saved.computeBox.obj._computeWorkspacesBoxForState =
+        this._saved.computeBox.fn;
+      delete this._saved.computeBox;
+    }
+  }
+
+  _restoreAll(c, ws) {
+    this._restoreSideEffects(c);
+    this._restoreComputeBox(c);
+    ws?.remove_style_class_name('drag-active');
+    ws?._fitModeAdjustment?.disconnectObject(this);
   }
 }
