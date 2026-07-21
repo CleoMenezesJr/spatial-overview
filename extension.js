@@ -8,7 +8,7 @@ const ZOOM_IN_DURATION = 400;
 export default class SpatialWorkspaceExtension extends Extension {
   enable() {
     this._dragActive = false;
-    this._originalUpdate = null;
+    this._savedFitModeDesc = null;
 
     this._dragBeginId = Main.overview.connect(
       'window-drag-begin', this._onDragBegin.bind(this));
@@ -39,16 +39,16 @@ export default class SpatialWorkspaceExtension extends Extension {
   }
 
   _onDragBegin() {
-    const controls = Main.overview._controls;
-    if (!controls)
+    const wsDisplay = Main.overview._controls?._workspacesDisplay;
+    if (!wsDisplay)
       return;
 
     this._dragActive = true;
-    controls._workspacesDisplay?.add_style_class_name('drag-active');
+    wsDisplay.add_style_class_name('drag-active');
 
-    this._patchUpdate(controls);
+    this._fakeFitMode(wsDisplay);
 
-    const fitAdj = controls._workspacesDisplay?._fitModeAdjustment;
+    const fitAdj = wsDisplay._fitModeAdjustment;
     if (!fitAdj)
       return;
 
@@ -62,16 +62,14 @@ export default class SpatialWorkspaceExtension extends Extension {
     if (!this._dragActive)
       return;
 
-    const controls = Main.overview._controls;
-    if (!controls)
-      return;
+    const wsDisplay = Main.overview._controls?._workspacesDisplay;
 
     this._dragActive = false;
-    controls._workspacesDisplay?.remove_style_class_name('drag-active');
+    wsDisplay?.remove_style_class_name('drag-active');
 
-    this._unpatchUpdate(controls);
+    this._unfakeFitMode(wsDisplay);
 
-    const fitAdj = controls._workspacesDisplay?._fitModeAdjustment;
+    const fitAdj = wsDisplay?._fitModeAdjustment;
     if (fitAdj)
       fitAdj.ease(0, {
         duration: ZOOM_IN_DURATION,
@@ -79,41 +77,37 @@ export default class SpatialWorkspaceExtension extends Extension {
       });
   }
 
-  _patchUpdate(controls) {
-    if (this._originalUpdate)
+  _fakeFitMode(wsDisplay) {
+    if (this._savedFitModeDesc)
       return;
 
-    this._originalUpdate = controls._update.bind(controls);
-    const extension = this;
+    const realAdj = wsDisplay._fitModeAdjustment;
 
-    controls._update = function () {
-      const fitModeAdjustment = this._workspacesDisplay?.fitModeAdjustment;
-      const savedProp = Object.getOwnPropertyDescriptor(
-        Object.getPrototypeOf(fitModeAdjustment), 'value');
+    // Proxy that always reports value = 1 (ALL) to _update()
+    const fakeAdj = Object.create(realAdj);
+    Object.defineProperty(fakeAdj, 'value', {
+      get: () => 1,
+      set: () => { /* _update() tries to snap → ignore */ },
+      configurable: true,
+      enumerable: true,
+    });
 
-      if (extension._dragActive && savedProp) {
-        Object.defineProperty(fitModeAdjustment, 'value', {
-          set() { /* block _update from snapping fit mode */ },
-          get() { return savedProp.get.call(this); },
-          configurable: true,
-          enumerable: true,
-        });
-      }
+    // Replace the public getter so _update() reads the fake
+    this._savedFitModeDesc =
+      Object.getOwnPropertyDescriptor(wsDisplay, 'fitModeAdjustment');
 
-      try {
-        extension._originalUpdate();
-      } finally {
-        if (savedProp)
-          Object.defineProperty(fitModeAdjustment, 'value', savedProp);
-      }
-    };
+    Object.defineProperty(wsDisplay, 'fitModeAdjustment', {
+      get: () => fakeAdj,
+      configurable: true,
+      enumerable: true,
+    });
   }
 
-  _unpatchUpdate(controls) {
-    if (!this._originalUpdate)
+  _unfakeFitMode(wsDisplay) {
+    if (!this._savedFitModeDesc || !wsDisplay)
       return;
 
-    controls._update = this._originalUpdate;
-    this._originalUpdate = null;
+    Object.defineProperty(wsDisplay, 'fitModeAdjustment', this._savedFitModeDesc);
+    this._savedFitModeDesc = null;
   }
 }
