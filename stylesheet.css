@@ -1,4 +1,3 @@
-/* Visual feedback during window drag — subtle workspace highlight */
-.workspaces-view.drag-active .workspace {
-  transition-duration: 250ms;
+.zoom-out-backdrop {
+  background-color: rgba(0, 0, 0, 0.55);
 }
