@@ -1,4 +1,3 @@
-import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
 import Clutter from 'gi://Clutter';
 import St from 'gi://St';
@@ -90,26 +89,6 @@ const ZoomOutView = GObject.registerClass({
     }
 });
 
-function _getThumbnailsBox() {
-    return Main.overview?._overview?.controls?._thumbnailsBox ?? null;
-}
-
-function _hideThumbnails() {
-    const box = _getThumbnailsBox();
-    if (box) {
-        box.visible = false;
-        box._spatialRestore = true;
-    }
-}
-
-function _showThumbnails() {
-    const box = _getThumbnailsBox();
-    if (box?._spatialRestore) {
-        box.visible = true;
-        delete box._spatialRestore;
-    }
-}
-
 export default class SpatialWorkspaceExtension extends Extension {
     enable() {
         this._dragActive = false;
@@ -122,16 +101,7 @@ export default class SpatialWorkspaceExtension extends Extension {
         this._zoomOutView = new ZoomOutView();
         Main.layoutManager.overviewGroup.add_child(this._zoomOutView);
 
-        this._overviewShownId = Main.overview?.connect(
-            'shown', () => {
-                _hideThumbnails();
-                GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
-                    _hideThumbnails();
-                    return GLib.SOURCE_REMOVE;
-                });
-            });
-
-        _hideThumbnails();
+        this._overrideThumbnailsShouldShow();
 
         this._progressSignalId = this._zoomOutView._progressAdj.connect(
             'notify::value', () => {
@@ -153,10 +123,7 @@ export default class SpatialWorkspaceExtension extends Extension {
         if (this._dragActive)
             this._onDragEnd();
 
-        if (this._overviewShownId) {
-            Main.overview?.disconnect(this._overviewShownId);
-            this._overviewShownId = null;
-        }
+        this._restoreThumbnailsShouldShow();
 
         if (this._progressSignalId && this._zoomOutView) {
             this._zoomOutView._progressAdj.disconnect(this._progressSignalId);
@@ -180,7 +147,6 @@ export default class SpatialWorkspaceExtension extends Extension {
         this._dragActive = false;
         this._resetDash();
         this._resetSearch();
-        _showThumbnails();
 
         if (this._zoomOutView) {
             this._zoomOutView.destroy();
@@ -207,10 +173,7 @@ export default class SpatialWorkspaceExtension extends Extension {
                 for (const w of view._workspaces ?? [])
                     w.reactive = true;
             }
-
         }
-
-        _hideThumbnails();
 
         if (this._zoomOutView)
             this._zoomOutView.show();
@@ -238,10 +201,37 @@ export default class SpatialWorkspaceExtension extends Extension {
             }
         }
 
-        _showThumbnails();
-
         if (this._zoomOutView)
             this._zoomOutView.hide();
+    }
+
+    _overrideThumbnailsShouldShow() {
+        const box = this._getThumbnailsBox();
+        if (!box)
+            return;
+
+        this._originalShouldShow = box._updateShouldShow;
+        box._updateShouldShow = () => {
+            const shouldShow = false;
+            if (box._shouldShow === shouldShow)
+                return;
+            box._shouldShow = shouldShow;
+            box.notify('should-show');
+        };
+        box._updateShouldShow();
+    }
+
+    _restoreThumbnailsShouldShow() {
+        const box = this._getThumbnailsBox();
+        if (box && this._originalShouldShow) {
+            box._updateShouldShow = this._originalShouldShow;
+            box._updateShouldShow();
+        }
+        this._originalShouldShow = null;
+    }
+
+    _getThumbnailsBox() {
+        return Main.overview?._overview?.controls?._thumbnailsBox ?? null;
     }
 
     _animateDash(progress) {
