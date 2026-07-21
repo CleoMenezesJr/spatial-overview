@@ -30,6 +30,7 @@ export default class SpatialWorkspaceExtension extends Extension {
       return;
 
     this._dragActive = true;
+    ws.add_style_class_name('drag-active');
 
     ws._fitModeAdjustment.connectObject('notify::value', () => {
       this._keepVisible(ws);
@@ -48,6 +49,7 @@ export default class SpatialWorkspaceExtension extends Extension {
     this._dragActive = false;
 
     const ws = Main.overview._controls?._workspacesDisplay;
+    ws?.remove_style_class_name('drag-active');
     ws?._fitModeAdjustment?.disconnectObject(this);
 
     ws?._fitModeAdjustment?.ease(0, {
