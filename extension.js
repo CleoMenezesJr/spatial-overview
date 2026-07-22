@@ -16,10 +16,6 @@ const BACKDROP_OPACITY = 180;
 const FIT_ALL = 1;
 const FIT_SINGLE = 0;
 
-const _uiGroupChildCount = 0;
-const _lastDragActorParent = null;
-const _lastDragActorPos = null;
-
 function uiGroupChildCount() {
     try {
         const ug = Main.uiGroup;
@@ -28,7 +24,7 @@ function uiGroupChildCount() {
         if (Array.isArray(kids)) return kids.length;
         if (typeof ug.get_n_children === 'function') return ug.get_n_children();
         return -1;
-    } catch (_e) {
+    } catch {
         return -1;
     }
 }
@@ -37,7 +33,7 @@ function dropInUiGroup(actor) {
     if (!actor) return false;
     try {
         return actor.get_parent?.() === Main.uiGroup;
-    } catch (_e) {
+    } catch {
         return false;
     }
 }
@@ -571,7 +567,7 @@ export default class SpatialWorkspaceExtension extends Extension {
             return -1;
         }
 
-        const debugRects = [];
+        const rects = [];
         for (let i = 0; i < workspaces.length; i++) {
             const wsActor = workspaces[i];
             if (!wsActor || !wsActor.visible || !wsActor.metaWorkspace)
@@ -580,7 +576,7 @@ export default class SpatialWorkspaceExtension extends Extension {
             const [ww, wh] = wsActor.get_transformed_size();
             if (ww <= 1 || wh <= 1)
                 continue;
-            debugRects.push({
+            rects.push({
                 i: wsActor.metaWorkspace.index(),
                 x: Math.round(wx), y: Math.round(wy),
                 w: Math.round(ww), h: Math.round(wh),
@@ -589,14 +585,14 @@ export default class SpatialWorkspaceExtension extends Extension {
                 logTime('_getWorkspaceIndexAt: HIT', {
                     wsIndex: wsActor.metaWorkspace.index(),
                     x: Math.round(x), y: Math.round(y),
-                    rect: debugRects[debugRects.length - 1],
+                    rect: rects[rects.length - 1],
                 });
                 return wsActor.metaWorkspace.index();
             }
         }
         logTime('_getWorkspaceIndexAt: MISS', {
             x: Math.round(x), y: Math.round(y),
-            rects: debugRects,
+            rects,
         });
         return -1;
     }
