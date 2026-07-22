@@ -7,10 +7,8 @@ import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as DND from 'resource:///org/gnome/shell/ui/dnd.js';
 import * as WorkspaceThumbnail from 'resource:///org/gnome/shell/ui/workspaceThumbnail.js';
-import * as Workspace from 'resource:///org/gnome/shell/ui/workspace.js';
 
 const TAG = '[SPATIAL-WS]';
-const log = (...a) => console.log(TAG, ...a);
 const logTime = (...a) => console.log(TAG, `t=${(Date.now() % 100000)}`, ...a);
 const ZOOM_OUT_DURATION = 250;
 const ZOOM_IN_DURATION = 250;
@@ -18,9 +16,9 @@ const BACKDROP_OPACITY = 180;
 const FIT_ALL = 1;
 const FIT_SINGLE = 0;
 
-let _uiGroupChildCount = 0;
-let _lastDragActorParent = null;
-let _lastDragActorPos = null;
+const _uiGroupChildCount = 0;
+const _lastDragActorParent = null;
+const _lastDragActorPos = null;
 
 function uiGroupChildCount() {
     try {
@@ -30,7 +28,7 @@ function uiGroupChildCount() {
         if (Array.isArray(kids)) return kids.length;
         if (typeof ug.get_n_children === 'function') return ug.get_n_children();
         return -1;
-    } catch (e) {
+    } catch (_e) {
         return -1;
     }
 }
@@ -39,7 +37,7 @@ function dropInUiGroup(actor) {
     if (!actor) return false;
     try {
         return actor.get_parent?.() === Main.uiGroup;
-    } catch (e) {
+    } catch (_e) {
         return false;
     }
 }
@@ -423,7 +421,6 @@ export default class SpatialWorkspaceExtension extends Extension {
             this._dropWasNoop = true;
             return false;
         }
-        const monitorIndex = Main.layoutManager.primaryIndex;
         logTime('_handleDrop: change_workspace CALLED', {
             from: currentWs?.index?.() ?? -1,
             to: wsIndex,
@@ -574,7 +571,7 @@ export default class SpatialWorkspaceExtension extends Extension {
             return -1;
         }
 
-        let debugRects = [];
+        const debugRects = [];
         for (let i = 0; i < workspaces.length; i++) {
             const wsActor = workspaces[i];
             if (!wsActor || !wsActor.visible || !wsActor.metaWorkspace)
@@ -677,12 +674,10 @@ export default class SpatialWorkspaceExtension extends Extension {
         const self = this;
 
         controls._update = function () {
-            const ws = this._workspacesDisplay;
-            const fitBefore = ws?._fitModeAdjustment?.value;
-
             self._originalUpdate.call(this);
 
             if (self._dragActive) {
+                const ws = this._workspacesDisplay;
                 if (ws?._fitModeAdjustment)
                     ws._fitModeAdjustment.value = FIT_ALL;
             }

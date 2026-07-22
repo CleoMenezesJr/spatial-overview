@@ -28,4 +28,4 @@ disable:
 	gnome-extensions disable "$(UUID)"
 
 lint:
-	shexli .
+	npx eslint .
