@@ -1,16 +1,48 @@
 import GObject from 'gi://GObject';
 import Clutter from 'gi://Clutter';
+import GLib from 'gi://GLib';
 import St from 'gi://St';
 
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as DND from 'resource:///org/gnome/shell/ui/dnd.js';
+import * as WorkspaceThumbnail from 'resource:///org/gnome/shell/ui/workspaceThumbnail.js';
+import * as Workspace from 'resource:///org/gnome/shell/ui/workspace.js';
 
-const ZOOM_OUT_DURATION = 500;
-const ZOOM_IN_DURATION = 350;
+const TAG = '[SPATIAL-WS]';
+const log = (...a) => console.log(TAG, ...a);
+const logTime = (...a) => console.log(TAG, `t=${(Date.now() % 100000)}`, ...a);
+const ZOOM_OUT_DURATION = 250;
+const ZOOM_IN_DURATION = 250;
 const BACKDROP_OPACITY = 180;
 const FIT_ALL = 1;
 const FIT_SINGLE = 0;
+
+let _uiGroupChildCount = 0;
+let _lastDragActorParent = null;
+let _lastDragActorPos = null;
+
+function uiGroupChildCount() {
+    try {
+        const ug = Main.uiGroup;
+        if (!ug) return -1;
+        const kids = ug.get_children?.();
+        if (Array.isArray(kids)) return kids.length;
+        if (typeof ug.get_n_children === 'function') return ug.get_n_children();
+        return -1;
+    } catch (e) {
+        return -1;
+    }
+}
+
+function dropInUiGroup(actor) {
+    if (!actor) return false;
+    try {
+        return actor.get_parent?.() === Main.uiGroup;
+    } catch (e) {
+        return false;
+    }
+}
 
 const ZoomOutView = GObject.registerClass({
     Signals: {
@@ -46,6 +78,7 @@ const ZoomOutView = GObject.registerClass({
     }
 
     show() {
+        logTime('VIEW.show start (zoom-out)');
         this.visible = true;
         this._progressAdj.ease(1, {
             duration: ZOOM_OUT_DURATION,
@@ -54,10 +87,12 @@ const ZoomOutView = GObject.registerClass({
     }
 
     hide() {
+        logTime('VIEW.hide start (zoom-in)');
         this._progressAdj.ease(0, {
             duration: ZOOM_IN_DURATION,
             mode: Clutter.AnimationMode.EASE_OUT_QUAD,
             onComplete: () => {
+                logTime('VIEW.hide onComplete (zoom-in DONE)');
                 this._backdrop.opacity = 0;
                 this.visible = false;
             },
@@ -97,16 +132,19 @@ const ZoomOutView = GObject.registerClass({
         if (!this._extension)
             return DND.DragMotionResult.CONTINUE;
         const wsIndex = this._extension._getWorkspaceIndexAt(x, y);
-        if (wsIndex < 0)
+        if (wsIndex < 0) {
+            logTime('VIEW.handleDragOver => CONTINUE (wsIndex < 0)', x, y);
             return DND.DragMotionResult.CONTINUE;
+        }
+        logTime('VIEW.handleDragOver => MOVE_DROP', {wsIndex, x, y});
         return DND.DragMotionResult.MOVE_DROP;
     }
 
     acceptDrop(source, dragActor, x, y, time) {
+        logTime('VIEW.acceptDrop REACHED', {x, y});
         if (!this._extension)
             return false;
-        this._extension._handleDrop(source, x, y);
-        return true;
+        return this._extension._handleDrop(source, x, y) === true;
     }
 });
 
@@ -120,6 +158,9 @@ export default class SpatialWorkspaceExtension extends Extension {
         this._dragEndId = null;
         this._dragCancelledId = null;
         this._progressSignalId = null;
+        this._pendingMove = null;
+
+        this._patchWindowCloneRestoreOnSuccess();
 
         this._zoomOutView = new ZoomOutView();
         this._zoomOutView._extension = this;
@@ -138,12 +179,55 @@ export default class SpatialWorkspaceExtension extends Extension {
         this._dragBeginId = Main.overview.connect(
             'window-drag-begin', this._onDragBegin.bind(this));
         this._dragEndId = Main.overview.connect(
-            'window-drag-end', this._onDragEnd.bind(this));
+            'window-drag-end', () => {
+                logTime('SIGNAL window-drag-end from overview');
+                this._onDragEnd(false);
+            });
         this._dragCancelledId = Main.overview.connect(
-            'window-drag-cancelled', this._onDragEnd.bind(this));
+            'window-drag-cancelled', () => {
+                logTime('SIGNAL window-drag-cancelled from overview');
+                this._onDragEnd(true);
+            });
+    }
+
+    _patchWindowCloneRestoreOnSuccess() {
+        if (this._windowClonePatched)
+            return;
+        const WindowClone = WorkspaceThumbnail.WindowClone;
+        const proto = WindowClone?.prototype;
+        if (!proto) {
+            logTime('WindowClone prototype not found!');
+            return;
+        }
+        const origInit = proto._init;
+        this._origWindowCloneInit = origInit;
+
+        proto._init = function (realWindow) {
+            const r = origInit.call(this, realWindow);
+            try {
+                if (this._draggable)
+                    this._draggable._restoreOnSuccess = false;
+            } catch (e) {
+                logTime('WindowClone patch error', e.message);
+            }
+            return r;
+        };
+        this._windowClonePatched = true;
+    }
+
+    _restoreWindowCloneInit() {
+        if (!this._windowClonePatched) return;
+        const WindowClone = WorkspaceThumbnail.WindowClone;
+        const proto = WindowClone?.prototype;
+        if (proto && this._origWindowCloneInit) {
+            proto._init = this._origWindowCloneInit;
+        }
+        this._origWindowCloneInit = null;
+        this._windowClonePatched = false;
     }
 
     disable() {
+        this._pendingMove = null;
         if (this._dragActive)
             this._onDragEnd();
 
@@ -174,6 +258,7 @@ export default class SpatialWorkspaceExtension extends Extension {
         }
 
         this._restoreControlsUpdate();
+        this._restoreWindowCloneInit();
         this._dragActive = false;
         this._resetDash();
         this._resetSearch();
@@ -185,28 +270,44 @@ export default class SpatialWorkspaceExtension extends Extension {
     }
 
     _onDragBegin() {
+        logTime('_onDragBegin ENTER (zoom-out will start)');
         this._dragActive = true;
 
         this._draggedMetaWindow = null;
         this._lastCursorX = 0;
         this._lastCursorY = 0;
+        this._dragMotionCount = 0;
+        this._activeDraggable = null;
 
         this._dragMonitor = {
             dragMotion: (dragEvent) => {
                 this._draggedMetaWindow = dragEvent.source?.metaWindow || this._draggedMetaWindow;
+                if (!this._activeDraggable && dragEvent.source?._draggable)
+                    this._activeDraggable = dragEvent.source._draggable;
                 this._lastCursorX = dragEvent.x;
                 this._lastCursorY = dragEvent.y;
+                this._dragMotionCount++;
+                if (this._dragMotionCount % 10 === 1)
+                    logTime('dragMotion', {
+                        n: this._dragMotionCount,
+                        x: dragEvent.x, y: dragEvent.y,
+                        dropActorInUiGroup: dropInUiGroup(dragEvent.dropActor),
+                        uiGroupChildren: uiGroupChildCount(),
+                    });
                 return DND.DragMotionResult.CONTINUE;
             },
+            // No dragDrop: skip monitor's drop callback entirely, let
+            // dnd.js's _dragActorDropped walk its target chain. Our ZoomOutView
+            // has acceptDrop which will handle the workspace change.
+            dragDrop: undefined,
         };
         DND.addDragMonitor(this._dragMonitor);
 
         const controls = this._getControls();
         if (controls) {
-            this._overrideControlsUpdate(controls);
-
             const ws = controls._workspacesDisplay;
             if (ws?._fitModeAdjustment) {
+                ws._fitModeAdjustment.remove_transition('value');
                 ws._fitModeAdjustment.ease(FIT_ALL, {
                     duration: ZOOM_OUT_DURATION,
                     mode: Clutter.AnimationMode.EASE_OUT_QUAD,
@@ -226,22 +327,60 @@ export default class SpatialWorkspaceExtension extends Extension {
 
     _handleDrop(source, x, y) {
         const metaWindow = source?.metaWindow ?? this._draggedMetaWindow;
-        if (!metaWindow)
-            return;
+        logTime('_handleDrop', {
+            hasSource: !!source,
+            hasMetaWindow: !!metaWindow,
+            x, y,
+            fromDraggedMW: source?.metaWindow == null,
+            sourceKeys: source ? Object.keys(source).filter(k => k !== '_delegate') : [],
+        });
+        if (!metaWindow) {
+            logTime('_handleDrop: NO metaWindow -> skip');
+            this._dropWasNoop = true;
+            return false;
+        }
         const wsIndex = this._getWorkspaceIndexAt(x, y);
-        if (wsIndex < 0)
-            return;
+        if (wsIndex < 0) {
+            logTime('_handleDrop: outside any workspace -> skip (no anim)');
+            this._dropWasNoop = true;
+            return false;
+        }
         const targetWs = global.workspace_manager.get_workspace_by_index(wsIndex);
-        if (metaWindow.get_workspace() === targetWs)
-            return;
+        const currentWs = metaWindow.get_workspace();
+        if (currentWs === targetWs) {
+            logTime('_handleDrop: same workspace -> skip (no anim)');
+            this._dropWasNoop = true;
+            return false;
+        }
+        const monitorIndex = Main.layoutManager.primaryIndex;
+        logTime('_handleDrop: change_workspace + snap to FIT_SINGLE CALLED', {
+            from: currentWs?.index?.() ?? -1,
+            to: wsIndex,
+            title: metaWindow.get_title?.() ?? '?',
+        });
         metaWindow.change_workspace(targetWs);
+        const ws = this._getWsDisplay();
+        if (ws?._fitModeAdjustment) {
+            ws._fitModeAdjustment.remove_transition('value');
+            ws._fitModeAdjustment.value = FIT_SINGLE;
+        }
+        logTime('_handleDrop: change_workspace RETURNED');
+        return true;
     }
 
-    _onDragEnd() {
-        if (!this._dragActive)
+    _onDragEnd(isCancel = false) {
+        if (!this._dragActive) {
+            logTime('_onDragEnd: not active (already ended?) -> skip');
             return;
+        }
 
-        this._dragActive = false;
+        logTime('_onDragEnd START', {
+            dragMotionTotal: this._dragMotionCount,
+            isCancel,
+            dropWasNoop: !!this._dropWasNoop,
+        });
+        const dropWasNoop = !!this._dropWasNoop;
+        this._dropWasNoop = false;
         this._restoreControlsUpdate();
 
         if (this._dragMonitor) {
@@ -251,10 +390,39 @@ export default class SpatialWorkspaceExtension extends Extension {
         this._draggedMetaWindow = null;
 
         const ws = this._getWsDisplay();
-        if (ws?._fitModeAdjustment) {
+        const alreadyChanged = ws?._fitModeAdjustment?.value === FIT_SINGLE;
+        if (!alreadyChanged && ws?._fitModeAdjustment) {
+            logTime('_onDragEnd: starting zoom-in ease to FIT_SINGLE', {isCancel});
+            ws._fitModeAdjustment.remove_transition('value');
             ws._fitModeAdjustment.ease(FIT_SINGLE, {
                 duration: ZOOM_IN_DURATION,
                 mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+            });
+        } else if (alreadyChanged) {
+            logTime('_onDragEnd: fitMode already FIT_SINGLE, no zoom-in');
+        }
+
+        if ((isCancel || dropWasNoop) && this._activeDraggable) {
+            logTime('HARMONY: hijacking _animateDragEnd', {isCancel, dropWasNoop});
+            const draggable = this._activeDraggable;
+            const origAnimate = draggable._animateDragEnd;
+            draggable._animateDragEnd = function (eventTime, _params) {
+                logTime('HARMONY: animate (instant) reached');
+                return origAnimate.call(this, eventTime, {duration: 0});
+            };
+            try {
+                const dragActor = draggable._dragActor;
+                if (dragActor) {
+                    dragActor.remove_all_transitions();
+                    dragActor.opacity = 0;
+                }
+            } catch (e) {
+                logTime('HARMONY: hide error', e.message);
+            }
+            const restoreId = draggable.connect('drag-end', () => {
+                logTime('HARMONY: drag-end -> restoring _animateDragEnd');
+                draggable._animateDragEnd = origAnimate;
+                draggable.disconnect(restoreId);
             });
         }
 
@@ -267,6 +435,31 @@ export default class SpatialWorkspaceExtension extends Extension {
 
         if (this._zoomOutView)
             this._zoomOutView.hide();
+
+        GLib.timeout_add(GLib.PRIORITY_DEFAULT, 800, () => {
+            logTime('POST-DRAG +800ms', {
+                uiGroupChildren: uiGroupChildCount(),
+                overviewVisible: Main.overview?.visible,
+                overviewInWindowDrag: Main.overview?._inWindowDrag,
+                grabCount: Main.layoutManager._grabHelper?._grabStack?.length ?? 'n/a',
+            });
+            this._zoomOutView?.add_style_class_name?.('post-probe-800');
+            return GLib.SOURCE_REMOVE;
+        });
+
+        GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1500, () => {
+            const controls = this._getControls?.();
+            const wsDisplay = controls?._workspacesDisplay;
+            const thumbsBox = controls?._thumbnailsBox;
+            logTime('POST-DRAG +1500ms', {
+                fitMode: wsDisplay?._fitModeAdjustment?.value,
+                thumbsBoxVisible: thumbsBox?.visible,
+                thumbsBoxShouldShow: thumbsBox?._shouldShow,
+                thumbCount: thumbsBox?._thumbnails?.length ?? 0,
+                thumbVisible: thumbsBox?._thumbnails?.map?.(t => ({ visible: t.visible, state: t.state, metaIndex: t.metaWorkspace?.index?.() })),
+            });
+            return GLib.SOURCE_REMOVE;
+        });
     }
 
     _getWorkspaceIndexAt(x, y) {
@@ -280,16 +473,58 @@ export default class SpatialWorkspaceExtension extends Extension {
         if (y < 0 || y > mon.height)
             return -1;
 
-        const topBarHeight = 32;
-        if (y < topBarHeight)
+        const display = this._getWsDisplay();
+        let workspaces = null;
+        const views = display?._workspacesViews;
+        if (Array.isArray(views)) {
+            for (const v of views) {
+                if (v?._workspaces && v._workspaces.length > 0) {
+                    workspaces = v._workspaces;
+                    break;
+                }
+            }
+        }
+        const wsView = display?._workspacesView;
+        if (!workspaces && wsView?._workspaces)
+            workspaces = wsView._workspaces;
+        if (!workspaces || workspaces.length === 0) {
+            logTime('_getWorkspaceIndexAt: no workspaces', {
+                hasDisplay: !!display,
+                hasWsView: !!wsView,
+                viewsCount: views?.length ?? 0,
+                wsCount: workspaces?.length ?? 0,
+            });
             return -1;
+        }
 
-        const nWorkspaces = global.workspace_manager.n_workspaces;
-        if (nWorkspaces === 0)
-            return -1;
-        const wsWidth = mon.width / nWorkspaces;
-        const index = Math.floor(x / wsWidth);
-        return Math.min(index, nWorkspaces - 1);
+        let debugRects = [];
+        for (let i = 0; i < workspaces.length; i++) {
+            const wsActor = workspaces[i];
+            if (!wsActor || !wsActor.visible || !wsActor.metaWorkspace)
+                continue;
+            const [wx, wy] = wsActor.get_transformed_position();
+            const [ww, wh] = wsActor.get_transformed_size();
+            if (ww <= 1 || wh <= 1)
+                continue;
+            debugRects.push({
+                i: wsActor.metaWorkspace.index(),
+                x: Math.round(wx), y: Math.round(wy),
+                w: Math.round(ww), h: Math.round(wh),
+            });
+            if (x >= wx && x <= wx + ww && y >= wy && y <= wy + wh) {
+                logTime('_getWorkspaceIndexAt: HIT', {
+                    wsIndex: wsActor.metaWorkspace.index(),
+                    x: Math.round(x), y: Math.round(y),
+                    rect: debugRects[debugRects.length - 1],
+                });
+                return wsActor.metaWorkspace.index();
+            }
+        }
+        logTime('_getWorkspaceIndexAt: MISS', {
+            x: Math.round(x), y: Math.round(y),
+            rects: debugRects,
+        });
+        return -1;
     }
 
     _overrideThumbnailsShouldShow() {
