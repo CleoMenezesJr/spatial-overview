@@ -258,6 +258,7 @@ export default class SpatialWorkspaceExtension extends Extension {
         }
 
         this._restoreControlsUpdate();
+        this._restoreWorkspacesState();
         this._restoreWindowCloneInit();
         this._dragActive = false;
         this._resetDash();
@@ -314,9 +315,79 @@ export default class SpatialWorkspaceExtension extends Extension {
                 });
             }
 
+            // FIXME downstream: whenever upstream GNOME exposes this flag,
+            // drop this monkey-patch. (Tracked for upstream contribution.)
+            //
+            // _updateWorkspacesState computes workspaceMode = (1 - fitMode) * lerp(...)
+            // which is 0 in FIT_ALL — causing WindowPreviews to render in
+            // desktop mode (overflowing the shrunken Workspace actor). We
+            // force stateAdjustment.value = 1 so WindowPreviews rearrange
+            // (overview layout) to fit the Workspace rect in FIT_ALL.
+            for (const view of ws._workspacesViews ?? []) {
+                if (!view._workspaces || view._origUpdateWorkspacesState)
+                    continue;
+                view._origUpdateWorkspacesState = view._updateWorkspacesState;
+                const origFn = view._origUpdateWorkspacesState;
+                view._updateWorkspacesState = function () {
+                    origFn?.call(this);
+                    for (const w of this._workspaces ?? [])
+                        w.stateAdjustment.value = 1;
+                };
+                view._updateWorkspacesState();
+            }
+
+            // FIXME downstream: in GNOME 50.3 WorkspaceLayout.vfunc_allocate
+            // computes window slots using the *container* box (the shrunken
+            // Workspace actor in FIT_ALL), so a single maximized window fills
+            // the entire shrunk rect (the WINDOW_PREVIEW_MAXIMUM_SCALE = 0.95
+            // cap never kicks in because horizontalScale = containerW/bbW is
+            // already < 0.95). Patch _getWindowSlots + _windowSlotsBox to use
+            // the full workarea-sized box for layout, so slots are computed
+            // at workarea scale and slotsScale (=containerW/workareaW)
+            // properly shrinks them into the Workspace actor.
             for (const view of ws._workspacesViews ?? []) {
                 for (const w of view._workspaces ?? []) {
-                    w.reactive = true;
+                    if (w._origClip === undefined) {
+                        w._origClip = w.clip_to_allocation;
+                        w.clip_to_allocation = true;
+                    }
+                    const container = w._container;
+                    if (container && container._origClip === undefined) {
+                        container._origClip = container.clip_to_allocation;
+                        container.clip_to_allocation = true;
+                    }
+
+                    const lm = container?.layout_manager;
+                    if (lm && lm._origGetWindowSlots === undefined) {
+                        lm._origGetWindowSlots = lm._getWindowSlots;
+                        lm._getWindowSlots = function (_containerBox) {
+                            if (!this._workarea || !this._layoutStrategy ||
+                                !this._layout) {
+                                return this._origGetWindowSlots.call(this, _containerBox);
+                            }
+                            // Bypass _adjustSpacingAndPadding which
+                            // shrinks the box based on monitor/stage
+                            // placements meaningless in FIT_ALL. Use the
+                            // full workarea-sized box directly so the
+                            // WINDOW_PREVIEW_MAXIMUM_SCALE = 0.95 cap
+                            // kicks in and slots fill ~95% of workarea.
+                            const workareaBox = new Clutter.ActorBox();
+                            workareaBox.set_origin(0, 0);
+                            workareaBox.set_size(this._workarea.width,
+                                this._workarea.height);
+                            const availArea = {
+                                x: 0,
+                                y: 0,
+                                width: this._workarea.width,
+                                height: this._workarea.height,
+                            };
+                            const slots =
+                                this._layoutStrategy.computeWindowSlots(
+                                    this._layout, availArea);
+                            this._windowSlotsBox = workareaBox;
+                            return slots;
+                        };
+                    }
                 }
             }
         }
@@ -373,6 +444,7 @@ export default class SpatialWorkspaceExtension extends Extension {
             logTime('_onDragEnd: not active (already ended?) -> skip');
             return;
         }
+        this._dragActive = false;
 
         logTime('_onDragEnd START', {
             dragMotionTotal: this._dragMotionCount,
@@ -397,9 +469,15 @@ export default class SpatialWorkspaceExtension extends Extension {
             ws._fitModeAdjustment.ease(FIT_SINGLE, {
                 duration: ZOOM_IN_DURATION,
                 mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                // FIXME downstream: paired with the monkey-patch in
+                // _onDragBegin. Restore _updateWorkspacesState after the
+                // zoom-in ease completes so WindowPreviews transition
+                // back to natural layout.
+                onStopped: () => this._restoreWorkspacesState(),
             });
-        } else if (alreadyChanged) {
+        } else {
             logTime('_onDragEnd: fitMode already FIT_SINGLE, no zoom-in');
+            this._restoreWorkspacesState();
         }
 
         if ((isCancel || dropWasNoop) && this._activeDraggable) {
@@ -621,6 +699,35 @@ export default class SpatialWorkspaceExtension extends Extension {
             controls._update = this._originalUpdate;
 
         this._originalUpdate = null;
+    }
+
+    _restoreWorkspacesState() {
+        const ws = this._getWsDisplay();
+        for (const view of ws?._workspacesViews ?? []) {
+            if (view._origUpdateWorkspacesState) {
+                view._updateWorkspacesState = view._origUpdateWorkspacesState;
+                view._origUpdateWorkspacesState = null;
+                view._updateWorkspacesState();
+            }
+            for (const w of view._workspaces ?? []) {
+                if (w._origClip !== undefined) {
+                    w.clip_to_allocation = w._origClip;
+                    w._origClip = undefined;
+                }
+                const container = w._container;
+                if (container && container._origClip !== undefined) {
+                    container.clip_to_allocation = container._origClip;
+                    container._origClip = undefined;
+                }
+                const lm = container?.layout_manager;
+                if (lm && lm._origGetWindowSlots !== undefined) {
+                    lm._windowSlotsBox = null;
+                    lm._getWindowSlots = lm._origGetWindowSlots;
+                    lm._origGetWindowSlots = undefined;
+                    lm.layout_changed();
+                }
+            }
+        }
     }
 
     _getControls() {
