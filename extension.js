@@ -424,17 +424,16 @@ export default class SpatialWorkspaceExtension extends Extension {
             return false;
         }
         const monitorIndex = Main.layoutManager.primaryIndex;
-        logTime('_handleDrop: change_workspace + snap to FIT_SINGLE CALLED', {
+        logTime('_handleDrop: change_workspace CALLED', {
             from: currentWs?.index?.() ?? -1,
             to: wsIndex,
             title: metaWindow.get_title?.() ?? '?',
         });
         metaWindow.change_workspace(targetWs);
-        const ws = this._getWsDisplay();
-        if (ws?._fitModeAdjustment) {
-            ws._fitModeAdjustment.remove_transition('value');
-            ws._fitModeAdjustment.value = FIT_SINGLE;
-        }
+        // Don't snap fitModeAdjustment here — _onDragEnd (triggered
+        // synchronously by change_workspace -> window-drag-end signal)
+        // owns the zoom-in ease. Snapping here would remove_transition
+        // and set value=FIT_SINGLE mid-ease, skipping the animation.
         logTime('_handleDrop: change_workspace RETURNED');
         return true;
     }
