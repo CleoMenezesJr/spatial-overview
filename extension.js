@@ -145,7 +145,6 @@ const ZoomOutView = GObject.registerClass({
 export default class SpatialWorkspaceExtension extends Extension {
     enable() {
         this._dragActive = false;
-        this._originalUpdate = null;
         this._dragMonitor = null;
         this._draggedMetaWindow = null;
         this._dragBeginId = null;
@@ -166,8 +165,6 @@ export default class SpatialWorkspaceExtension extends Extension {
             'notify::value', () => {
                 const p = this._zoomOutView._progressAdj.value;
                 this._zoomOutView?.updateProgress(p);
-                this._animateDash(p);
-                this._animateSearch(p);
             });
 
         this._dragBeginId = Main.overview.connect(
@@ -251,12 +248,9 @@ export default class SpatialWorkspaceExtension extends Extension {
             this._dragCancelledId = null;
         }
 
-        this._restoreControlsUpdate();
         this._restoreWorkspacesState();
         this._restoreWindowCloneInit();
         this._dragActive = false;
-        this._resetDash();
-        this._resetSearch();
 
         if (this._zoomOutView) {
             this._zoomOutView.destroy();
@@ -267,6 +261,7 @@ export default class SpatialWorkspaceExtension extends Extension {
     _onDragBegin() {
         logTime('_onDragBegin ENTER (zoom-out will start)');
         this._dragActive = true;
+        const self = this;
 
         this._draggedMetaWindow = null;
         this._lastCursorX = 0;
@@ -301,7 +296,7 @@ export default class SpatialWorkspaceExtension extends Extension {
         const controls = this._getControls();
         if (controls) {
             const ws = controls._workspacesDisplay;
-            if (ws?._fitModeAdjustment) {
+            if (ws?._fitModeAdjustment && !self._isInAppGrid()) {
                 ws._fitModeAdjustment.remove_transition('value');
                 ws._fitModeAdjustment.ease(FIT_ALL, {
                     duration: ZOOM_OUT_DURATION,
@@ -324,8 +319,10 @@ export default class SpatialWorkspaceExtension extends Extension {
                 const origFn = view._origUpdateWorkspacesState;
                 view._updateWorkspacesState = function () {
                     origFn?.call(this);
-                    for (const w of this._workspaces ?? [])
-                        w.stateAdjustment.value = 1;
+                    if (!self._isInAppGrid()) {
+                        for (const w of this._workspaces ?? [])
+                            w.stateAdjustment.value = 1;
+                    }
                 };
                 view._updateWorkspacesState();
             }
@@ -355,6 +352,9 @@ export default class SpatialWorkspaceExtension extends Extension {
                     if (lm && lm._origGetWindowSlots === undefined) {
                         lm._origGetWindowSlots = lm._getWindowSlots;
                         lm._getWindowSlots = function (_containerBox) {
+                            if (self._isInAppGrid()) {
+                                return this._origGetWindowSlots.call(this, _containerBox);
+                            }
                             if (!this._workarea || !this._layoutStrategy ||
                                 !this._layout) {
                                 const slots =
@@ -449,7 +449,6 @@ export default class SpatialWorkspaceExtension extends Extension {
         });
         const dropWasNoop = !!this._dropWasNoop;
         this._dropWasNoop = false;
-        this._restoreControlsUpdate();
 
         if (this._dragMonitor) {
             DND.removeDragMonitor(this._dragMonitor);
@@ -458,8 +457,9 @@ export default class SpatialWorkspaceExtension extends Extension {
         this._draggedMetaWindow = null;
 
         const ws = this._getWsDisplay();
+        const inAppGrid = this._isInAppGrid();
         const alreadyChanged = ws?._fitModeAdjustment?.value === FIT_SINGLE;
-        if (!alreadyChanged && ws?._fitModeAdjustment) {
+        if (!alreadyChanged && ws?._fitModeAdjustment && !inAppGrid) {
             logTime('_onDragEnd: starting zoom-in ease to FIT_SINGLE', {isCancel});
             ws._fitModeAdjustment.remove_transition('value');
             ws._fitModeAdjustment.ease(FIT_SINGLE, {
@@ -472,7 +472,7 @@ export default class SpatialWorkspaceExtension extends Extension {
                 onStopped: () => this._restoreWorkspacesState(),
             });
         } else {
-            logTime('_onDragEnd: fitMode already FIT_SINGLE, no zoom-in');
+            logTime('_onDragEnd: fitMode already FIT_SINGLE or inAppGrid, no zoom-in', {isCancel, inAppGrid});
             this._restoreWorkspacesState();
         }
 
@@ -630,75 +630,6 @@ export default class SpatialWorkspaceExtension extends Extension {
         return Main.overview?._overview?.controls?._thumbnailsBox ?? null;
     }
 
-    _animateDash(progress) {
-        const dash = Main.overview?.dash;
-        if (!dash)
-            return;
-
-        const dashHeight = dash.height || 100;
-        const ty = Math.round(progress * dashHeight);
-        if (Number.isFinite(ty))
-            dash.translation_y = ty;
-        dash.opacity = Math.round((1 - progress) * 255);
-    }
-
-    _resetDash() {
-        const dash = Main.overview?.dash;
-        if (!dash)
-            return;
-        dash.translation_y = 0;
-        dash.opacity = 255;
-    }
-
-    _animateSearch(progress) {
-        const entry = Main.overview?._overview?.controls?._searchController?._entry;
-        if (!entry)
-            return;
-
-        const entryHeight = entry.height || 50;
-        const ty = Math.round(-progress * entryHeight);
-        if (Number.isFinite(ty))
-            entry.translation_y = ty;
-        entry.opacity = Math.round((1 - progress) * 255);
-    }
-
-    _resetSearch() {
-        const entry = Main.overview?._overview?.controls?._searchController?._entry;
-        if (!entry)
-            return;
-        entry.translation_y = 0;
-        entry.opacity = 255;
-    }
-
-    _overrideControlsUpdate(controls) {
-        if (this._originalUpdate)
-            return;
-
-        this._originalUpdate = controls._update.bind(controls);
-        const self = this;
-
-        controls._update = function () {
-            self._originalUpdate.call(this);
-
-            if (self._dragActive) {
-                const ws = this._workspacesDisplay;
-                if (ws?._fitModeAdjustment)
-                    ws._fitModeAdjustment.value = FIT_ALL;
-            }
-        };
-    }
-
-    _restoreControlsUpdate() {
-        if (!this._originalUpdate)
-            return;
-
-        const controls = this._getControls();
-        if (controls)
-            controls._update = this._originalUpdate;
-
-        this._originalUpdate = null;
-    }
-
     _restoreWorkspacesState() {
         const ws = this._getWsDisplay();
         for (const view of ws?._workspacesViews ?? []) {
@@ -733,5 +664,11 @@ export default class SpatialWorkspaceExtension extends Extension {
 
     _getWsDisplay() {
         return this._getControls()?._workspacesDisplay ?? null;
+    }
+
+    _isInAppGrid() {
+        const controls = this._getControls();
+        const params = controls?._stateAdjustment?.getStateTransitionParams?.();
+        return params?.finalState === 2; // ControlsState.APP_GRID
     }
 }
