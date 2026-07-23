@@ -110,19 +110,19 @@ const ZoomOutView = GObject.registerClass({
         this._backdrop.allocate(backdropBox);
     }
 
-    vfunc_get_preferred_width(forHeight) {
+    vfunc_get_preferred_width() {
         const mon = Main.layoutManager.monitors[
             Main.layoutManager.primaryIndex];
         return [0, mon ? mon.width : 1920];
     }
 
-    vfunc_get_preferred_height(forWidth) {
+    vfunc_get_preferred_height() {
         const mon = Main.layoutManager.monitors[
             Main.layoutManager.primaryIndex];
         return [0, mon ? mon.height : 1080];
     }
 
-    handleDragOver(source, dragActor, x, y, time) {
+    handleDragOver(_source, _dragActor, x, y, _time) {
         if (!this._extension)
             return DND.DragMotionResult.CONTINUE;
         const wsIndex = this._extension._getWorkspaceIndexAt(x, y);
@@ -134,7 +134,7 @@ const ZoomOutView = GObject.registerClass({
         return DND.DragMotionResult.MOVE_DROP;
     }
 
-    acceptDrop(source, dragActor, x, y, time) {
+    acceptDrop(source, _dragActor, x, y, _time) {
         logTime('VIEW.acceptDrop REACHED', {x, y});
         if (!this._extension)
             return false;
@@ -151,7 +151,6 @@ export default class SpatialWorkspaceExtension extends Extension {
         this._dragEndId = null;
         this._dragCancelledId = null;
         this._progressSignalId = null;
-        this._pendingMove = null;
 
         this._patchWindowCloneRestoreOnSuccess();
 
@@ -218,7 +217,6 @@ export default class SpatialWorkspaceExtension extends Extension {
     }
 
     disable() {
-        this._pendingMove = null;
         if (this._dragActive)
             this._onDragEnd();
 
