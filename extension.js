@@ -357,7 +357,11 @@ export default class SpatialWorkspaceExtension extends Extension {
                         lm._getWindowSlots = function (_containerBox) {
                             if (!this._workarea || !this._layoutStrategy ||
                                 !this._layout) {
-                                return this._origGetWindowSlots.call(this, _containerBox);
+                                const slots =
+                                    this._origGetWindowSlots.call(this, _containerBox);
+                                if (!this._windowSlotsBox && _containerBox)
+                                    this._windowSlotsBox = _containerBox;
+                                return slots;
                             }
                             // Bypass _adjustSpacingAndPadding which
                             // shrinks the box based on monitor/stage
@@ -632,7 +636,9 @@ export default class SpatialWorkspaceExtension extends Extension {
             return;
 
         const dashHeight = dash.height || 100;
-        dash.translation_y = Math.round(progress * dashHeight);
+        const ty = Math.round(progress * dashHeight);
+        if (Number.isFinite(ty))
+            dash.translation_y = ty;
         dash.opacity = Math.round((1 - progress) * 255);
     }
 
@@ -650,7 +656,9 @@ export default class SpatialWorkspaceExtension extends Extension {
             return;
 
         const entryHeight = entry.height || 50;
-        entry.translation_y = Math.round(-progress * entryHeight);
+        const ty = Math.round(-progress * entryHeight);
+        if (Number.isFinite(ty))
+            entry.translation_y = ty;
         entry.opacity = Math.round((1 - progress) * 255);
     }
 
@@ -711,7 +719,6 @@ export default class SpatialWorkspaceExtension extends Extension {
                 }
                 const lm = container?.layout_manager;
                 if (lm && lm._origGetWindowSlots !== undefined) {
-                    lm._windowSlotsBox = null;
                     lm._getWindowSlots = lm._origGetWindowSlots;
                     lm._origGetWindowSlots = undefined;
                     lm.layout_changed();
