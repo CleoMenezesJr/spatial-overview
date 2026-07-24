@@ -1,3 +1,14 @@
 .zoom-out-backdrop {
   background-color: rgba(0, 0, 0, 0.55);
 }
+
+/* FIXME downstream: replica of the upstream ThumbnailsBox _dropPlaceholder
+   style (workspaceThumbnail.js:613, themed via gnome-shell's .placeholder
+   class). Identical CSS to gnome-shell-theme .placeholder rules:
+   width: 18px, height: 32px, background-image from workspace-placeholder.svg.
+   We re-use the same SVG already embedded in gnome-shell-theme.gresource. */
+.placeholder {
+  background-image: url("resource:///org/gnome/shell/theme/workspace-placeholder.svg");
+  background-size: contain;
+  width: 24px;
+}
