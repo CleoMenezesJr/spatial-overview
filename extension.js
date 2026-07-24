@@ -42,7 +42,7 @@ function dropInUiGroup(actor) {
 }
 
 // Replicates _getRealActorScale from dnd.js (not exported upstream).
-// Walks up the actor tree multiplying scale_x — needed to compute
+// Walks up the actor tree multiplying scale_x - needed to compute
 // the FIT_SINGLE stage position of the clone's parent (workspace
 // thumbnail) before our zoom-out has changed it.
 function _getRealActorScale(actor) {
@@ -217,7 +217,7 @@ const ZoomOutView = GObject.registerClass({
     }
 });
 
-export default class SpatialWorkspaceExtension extends Extension {
+export default class SpatialOverviewExtension extends Extension {
     enable() {
         this._dragActive = false;
         this._dragMonitor = null;
@@ -271,7 +271,7 @@ export default class SpatialWorkspaceExtension extends Extension {
         this._origWindowCloneInit = origInit;
         const ext = this;
 
-        // Maps for snap-back: metaWindow → FIT_SINGLE parent info
+        // maps metaWindow -> FIT_SINGLE parent pos+scale for snap-back
         this._fitSingleByMetaWindow = new Map();
 
         proto._init = function (realWindow) {
@@ -530,13 +530,8 @@ export default class SpatialWorkspaceExtension extends Extension {
         logTime('_onDragBegin ENTER (zoom-out will start)');
         this._dragActive = true;
         const self = this;
+        this._draggedMetaWindow = metaWindow;
 
-        // Look up FIT_SINGLE parent position+scale captured by the patched
-        // Draggable._gestureRecognized (before zoom-out, when transforms
-        // are still valid). Used by _getRestoreLocation override.
-        this._fitSingleParent = this._fitSingleByMetaWindow?.get(metaWindow) ?? null;
-
-        this._draggedMetaWindow = null;
         this._lastCursorX = 0;
         this._lastCursorY = 0;
         this._dragMotionCount = 0;
@@ -547,6 +542,11 @@ export default class SpatialWorkspaceExtension extends Extension {
                 this._draggedMetaWindow = dragEvent.source?.metaWindow || this._draggedMetaWindow;
                 if (!this._activeDraggable && dragEvent.source?._draggable) {
                     this._activeDraggable = dragEvent.source._draggable;
+                    // lookup here, not in _onDragBegin: patched _gestureRecognized
+                    // populates the map synchronously AFTER origGR triggers
+                    // drag-begin then window-drag-begin, so reading it in
+                    // _onDragBegin always sees an empty map
+                    self._fitSingleParent = self._fitSingleByMetaWindow?.get(this._draggedMetaWindow) ?? null;
                     // FIXME downstream: GNOME's _getRestoreLocation uses the
                     // parent's *current* transformed position at snap-back
                     // time. During our zoom-out (FIT_ALL) the parent is
@@ -611,7 +611,7 @@ export default class SpatialWorkspaceExtension extends Extension {
             // drop this monkey-patch. (Tracked for upstream contribution.)
             //
             // _updateWorkspacesState computes workspaceMode = (1 - fitMode) * lerp(...)
-            // which is 0 in FIT_ALL — causing WindowPreviews to render in
+            // which is 0 in FIT_ALL - causing WindowPreviews to render in
             // desktop mode (overflowing the shrunken Workspace actor). We
             // force stateAdjustment.value = 1 so WindowPreviews rearrange
             // (overview layout) to fit the Workspace rect in FIT_ALL.
@@ -748,7 +748,7 @@ export default class SpatialWorkspaceExtension extends Extension {
         });
         metaWindow.change_workspace(targetWs);
         this._hideDropPlaceholder();
-        // Don't snap fitModeAdjustment here — _onDragEnd (triggered
+        // Don't snap fitModeAdjustment here - _onDragEnd (triggered
         // synchronously by change_workspace -> window-drag-end signal)
         // owns the zoom-in ease. Snapping here would remove_transition
         // and set value=FIT_SINGLE mid-ease, skipping the animation.
@@ -802,7 +802,6 @@ export default class SpatialWorkspaceExtension extends Extension {
             isCancel,
             dropWasNoop: !!this._dropWasNoop,
         });
-        const dropWasNoop = !!this._dropWasNoop;
         this._dropWasNoop = false;
 
         if (this._dragMonitor) {
@@ -955,7 +954,7 @@ export default class SpatialWorkspaceExtension extends Extension {
     // Main.wm.insertWorkspace(index) will shift subsequent workspaces
     // rightward, matching upstream ThumbnailsBox semantics).
     //
-    // Gated by Meta.prefs_get_dynamic_workspaces() — same condition the
+    // Gated by Meta.prefs_get_dynamic_workspaces() - same condition the
     // upstream thumbnails check enforces (workspaceThumbnail.js:836).
     // Returns -1 when dynamic workspaces are off, mirroring upstream.
     _getInsertWorkspaceIndex(x, y) {
@@ -967,7 +966,7 @@ export default class SpatialWorkspaceExtension extends Extension {
         if (x < 0 || x > monitor.width || y < 0 || y > monitor.height)
             return -1;
 
-        // Use the first rect's y-band as a shared vertical band — works
+        // Use the first rect's y-band as a shared vertical band - works
         // because in FIT_ALL all workspaces share the same vertical band.
         const yTop = rects[0].y;
         const yBot = rects[0].y + rects[0].h;
