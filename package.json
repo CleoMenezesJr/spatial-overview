@@ -1,1 +1,1 @@
-{"name": "spatial-workspace", "private": true, "type": "module", "scripts": {"lint": "eslint ."}, "devDependencies": {"eslint": "^9.0.0", "neostandard": "^0.11.0"}}
+{"name": "spatial-overview", "private": true, "type": "module", "scripts": {"lint": "eslint ."}, "devDependencies": {"eslint": "^9.0.0", "neostandard": "^0.11.0"}}
