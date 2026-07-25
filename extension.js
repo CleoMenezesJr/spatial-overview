@@ -352,6 +352,7 @@ export default class SpatialOverviewExtension extends Extension {
         this._origGetFirstFitAllWorkspaceBox = proto._getFirstFitAllWorkspaceBox;
         this._origGetSpacing = proto._getSpacing;
         const origGetSpacing = this._origGetSpacing;
+        const self = this;
 
         // Shared helper: computes scale + adjusted spacing for FitMode.ALL.
         // Returns {scale, wsSize, adjSpacing} where wsSize is the workspace
@@ -400,8 +401,8 @@ export default class SpatialOverviewExtension extends Extension {
         };
 
         proto._getSpacing = function (box, fitMode, vertical) {
-            // Delegate to original for non-ALL modes.
-            if (fitMode !== 1) // FitMode.ALL === 1
+            // Delegate to original for non-ALL modes or when in app grid.
+            if (fitMode !== 1 || self._isInAppGrid()) // FitMode.ALL === 1
                 return origGetSpacing.call(this, box, fitMode, vertical);
 
             const [width, height] = box.get_size();
@@ -423,6 +424,9 @@ export default class SpatialOverviewExtension extends Extension {
         };
 
         proto._getFirstFitAllWorkspaceBox = function (box, spacing, vertical) {
+            if (self._isInAppGrid())
+                return self._origGetFirstFitAllWorkspaceBox.call(this, box, spacing, vertical);
+
             const {nWorkspaces} = global.workspaceManager;
             const [width, height] = box.get_size();
             const [workspace] = this._workspaces;
@@ -1114,6 +1118,6 @@ export default class SpatialOverviewExtension extends Extension {
     _isInAppGrid() {
         const controls = this._getControls();
         const params = controls?._stateAdjustment?.getStateTransitionParams?.();
-        return params?.finalState === 2; // ControlsState.APP_GRID
+        return params?.finalState === 2;
     }
 }
