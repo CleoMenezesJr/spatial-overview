@@ -20,6 +20,9 @@ enable:
 disable:
 	gnome-extensions disable "$(UUID)"
 
+# shexli analyses an extension package, so give it one: pointed at the source
+# tree it walks node_modules and aborts over its file limit.
 lint:
-	shexli .
+	@tmp=$$(mktemp -d) && cp $(FILES) "$$tmp" && shexli "$$tmp"; \
+		rc=$$?; rm -rf "$$tmp"; exit $$rc
 	npx eslint .
