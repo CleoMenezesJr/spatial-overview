@@ -2,7 +2,7 @@
   "uuid": "spatial-overview@cleomenezesjr.github.io",
   "name": "Spatial Overview",
   "description": "Zooms out workspaces to show all horizontally when dragging a window in the overview",
-  "shell-version": ["50"],
+  "shell-version": ["50", "51"],
   "url": "https://github.com/CleoMenezesJr/spatial-overview",
   "version-name": "1.0"
 }
