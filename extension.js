@@ -15,8 +15,8 @@ const DEBUG = GLib.getenv('SPATIAL_WS_DEBUG') !== null;
 const logTime = DEBUG
     ? (...a) => console.log(TAG, `t=${Date.now() % 100000}`, ...a)
     : () => {};
-const ZOOM_OUT_DURATION = 250;
-const ZOOM_IN_DURATION = 250;
+const ZOOM_OUT_DURATION = 400;
+const ZOOM_IN_DURATION = 400;
 const BACKDROP_OPACITY = 180;
 const MIN_WS_SCALE = 0.18;
 const WORKSPACE_CUT_SIZE = 10; // workspaceThumbnail.js:27
