@@ -7,7 +7,8 @@ import St from 'gi://St';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as DND from 'resource:///org/gnome/shell/ui/dnd.js';
-import {WorkspacesView} from 'resource:///org/gnome/shell/ui/workspacesView.js';
+import {FitMode, WorkspacesView} from 'resource:///org/gnome/shell/ui/workspacesView.js';
+import {ControlsState} from 'resource:///org/gnome/shell/ui/overviewControls.js';
 
 const TAG = '[SPATIAL-WS]';
 const DEBUG = GLib.getenv('SPATIAL_WS_DEBUG') !== null;
@@ -17,15 +18,13 @@ const logTime = DEBUG
 const ZOOM_OUT_DURATION = 250;
 const ZOOM_IN_DURATION = 250;
 const BACKDROP_OPACITY = 180;
-const FIT_ALL = 1;
-const FIT_SINGLE = 0;
 const MIN_WS_SCALE = 0.18;
 const WORKSPACE_CUT_SIZE = 10; // workspaceThumbnail.js:27
 const PLACEHOLDER_WIDTH = 24;
 
 // Replicates _getRealActorScale from dnd.js (not exported upstream).
 // Walks up the actor tree multiplying scale_x - needed to compute
-// the FIT_SINGLE stage position of the clone's parent (workspace
+// the FitMode.SINGLE stage position of the clone's parent (workspace
 // thumbnail) before our zoom-out has changed it.
 function _getRealActorScale(actor) {
     let scale = 1.0;
@@ -256,7 +255,7 @@ export default class SpatialOverviewExtension extends Extension {
 
     // FIXME downstream: _getRestoreLocation (dnd.js:453) reads the drag origin
     // parent's transformed position at drop time (dnd.js:465-466), when our
-    // zoom-out has already moved it to FIT_ALL. Capture the FIT_SINGLE
+    // zoom-out has already moved it to FitMode.ALL. Capture the FitMode.SINGLE
     // transform at gesture recognition instead.
     // Ideal upstream fix: snapshot the restore location in _gestureRecognized,
     // where _dragOrigParent/_dragOrigX/Y/Scale are already recorded, or take it
@@ -279,7 +278,7 @@ export default class SpatialOverviewExtension extends Extension {
             return;
         }
 
-        // maps metaWindow -> FIT_SINGLE parent pos+scale for snap-back
+        // maps metaWindow -> FitMode.SINGLE parent pos+scale for snap-back
         this._fitSingleByMetaWindow = new Map();
 
         const ext = this;
@@ -290,7 +289,7 @@ export default class SpatialOverviewExtension extends Extension {
         dragProto._gestureRecognized = function () {
             const result = origGestureRecognized.call(this);
             // _dragOrigParent is set inside _gestureRecognized (dnd.js:199) and
-            // still holds the FIT_SINGLE transform: our ease was only queued.
+            // still holds the FitMode.SINGLE transform: our ease was only queued.
             // dnd.js nulls it on destroy, so get_stage() is all we need to know
             // the transform is meaningful.
             const parent = this._dragOrigParent;
@@ -399,7 +398,7 @@ export default class SpatialOverviewExtension extends Extension {
 
         proto._getSpacing = function (box, fitMode, vertical) {
             // Delegate to original for non-ALL modes or when in app grid.
-            if (fitMode !== 1 || self._isInAppGrid()) // FitMode.ALL === 1
+            if (fitMode !== FitMode.ALL || self._isInAppGrid())
                 return origGetSpacing.call(this, box, fitMode, vertical);
 
             const [width, height] = box.get_size();
@@ -553,17 +552,17 @@ export default class SpatialOverviewExtension extends Extension {
                     self._fitSingleParent = self._fitSingleByMetaWindow?.get(this._draggedMetaWindow) ?? null;
                     // FIXME downstream: GNOME's _getRestoreLocation uses the
                     // parent's *current* transformed position at snap-back
-                    // time. During our zoom-out (FIT_ALL) the parent is
-                    // repositioned, so the snap-back would target FIT_ALL.
-                    // We replace it with the clone's captured FIT_SINGLE
+                    // time. During our zoom-out (FitMode.ALL) the parent is
+                    // repositioned, so the snap-back would target FitMode.ALL.
+                    // We replace it with the clone's captured FitMode.SINGLE
                     // stage position (captured in patched Draggable._gestureRecognized).
                     const draggable = this._activeDraggable;
                     this._origGetRestoreLocation = draggable._getRestoreLocation;
                     draggable._getRestoreLocation = function () {
                         if (self._fitSingleParent) {
-                            // _fitSingleParent has the FIT_SINGLE parent stage pos+scale.
-                            // _dragOrigX/Y are the clone's allocation within the parent (FIT_SINGLE).
-                            // Compute the clone's FIT_SINGLE stage position.
+                            // _fitSingleParent has the FitMode.SINGLE parent stage pos+scale.
+                            // _dragOrigX/Y are the clone's allocation within the parent (FitMode.SINGLE).
+                            // Compute the clone's FitMode.SINGLE stage position.
                             const p = self._fitSingleParent;
                             return [
                                 p.px + p.scale * this._dragOrigX,
@@ -603,7 +602,7 @@ export default class SpatialOverviewExtension extends Extension {
             const ws = controls._workspacesDisplay;
             if (ws?._fitModeAdjustment && !self._isInAppGrid()) {
                 ws._fitModeAdjustment.remove_transition('value');
-                ws._fitModeAdjustment.ease(FIT_ALL, {
+                ws._fitModeAdjustment.ease(FitMode.ALL, {
                     duration: ZOOM_OUT_DURATION,
                     mode: Clutter.AnimationMode.EASE_OUT_QUAD,
                 });
@@ -613,10 +612,10 @@ export default class SpatialOverviewExtension extends Extension {
             // drop this monkey-patch. (Tracked for upstream contribution.)
             //
             // _updateWorkspacesState computes workspaceMode = (1 - fitMode) * lerp(...)
-            // which is 0 in FIT_ALL - causing WindowPreviews to render in
+            // which is 0 in FitMode.ALL - causing WindowPreviews to render in
             // desktop mode (overflowing the shrunken Workspace actor). We
             // force stateAdjustment.value = 1 so WindowPreviews rearrange
-            // (overview layout) to fit the Workspace rect in FIT_ALL.
+            // (overview layout) to fit the Workspace rect in FitMode.ALL.
             for (const view of ws._workspacesViews ?? []) {
                 if (!view._workspaces || view._origUpdateWorkspacesState)
                     continue;
@@ -634,7 +633,7 @@ export default class SpatialOverviewExtension extends Extension {
 
             // FIXME downstream: in GNOME 50.3 WorkspaceLayout.vfunc_allocate
             // computes window slots using the *container* box (the shrunken
-            // Workspace actor in FIT_ALL), so a single maximized window fills
+            // Workspace actor in FitMode.ALL), so a single maximized window fills
             // the entire shrunk rect (the WINDOW_PREVIEW_MAXIMUM_SCALE = 0.95
             // cap never kicks in because horizontalScale = containerW/bbW is
             // already < 0.95). Patch _getWindowSlots + _windowSlotsBox to use
@@ -670,7 +669,7 @@ export default class SpatialOverviewExtension extends Extension {
                             }
                             // Bypass _adjustSpacingAndPadding which
                             // shrinks the box based on monitor/stage
-                            // placements meaningless in FIT_ALL. Use the
+                            // placements meaningless in FitMode.ALL. Use the
                             // full workarea-sized box directly so the
                             // WINDOW_PREVIEW_MAXIMUM_SCALE = 0.95 cap
                             // kicks in and slots fill ~95% of workarea.
@@ -751,7 +750,7 @@ export default class SpatialOverviewExtension extends Extension {
         // Don't snap fitModeAdjustment here - _onDragEnd (triggered
         // synchronously by change_workspace -> window-drag-end signal)
         // owns the zoom-in ease. Snapping here would remove_transition
-        // and set value=FIT_SINGLE mid-ease, skipping the animation.
+        // and set value=FitMode.SINGLE mid-ease, skipping the animation.
         logTime('_handleDrop: change_workspace RETURNED');
         return true;
     }
@@ -821,11 +820,11 @@ export default class SpatialOverviewExtension extends Extension {
 
         const ws = this._getWsDisplay();
         const inAppGrid = this._isInAppGrid();
-        const alreadyChanged = ws?._fitModeAdjustment?.value === FIT_SINGLE;
+        const alreadyChanged = ws?._fitModeAdjustment?.value === FitMode.SINGLE;
         if (!alreadyChanged && ws?._fitModeAdjustment && !inAppGrid) {
-            logTime('_onDragEnd: starting zoom-in ease to FIT_SINGLE', {isCancel});
+            logTime('_onDragEnd: starting zoom-in ease to FitMode.SINGLE', {isCancel});
             ws._fitModeAdjustment.remove_transition('value');
-            ws._fitModeAdjustment.ease(FIT_SINGLE, {
+            ws._fitModeAdjustment.ease(FitMode.SINGLE, {
                 duration: ZOOM_IN_DURATION,
                 mode: Clutter.AnimationMode.EASE_OUT_QUAD,
                 onStopped: () => {
@@ -839,7 +838,7 @@ export default class SpatialOverviewExtension extends Extension {
                 },
             });
         } else {
-            logTime('_onDragEnd: fitMode already FIT_SINGLE or inAppGrid, no zoom-in', {isCancel, inAppGrid});
+            logTime('_onDragEnd: fitMode already FitMode.SINGLE or inAppGrid, no zoom-in', {isCancel, inAppGrid});
             this._restoreWorkspacesState();
         }
 
@@ -982,7 +981,7 @@ export default class SpatialOverviewExtension extends Extension {
             return -1;
 
         // Use the first rect's y-band as a shared vertical band - works
-        // because in FIT_ALL all workspaces share the same vertical band.
+        // because in FitMode.ALL all workspaces share the same vertical band.
         const yTop = rects[0].y;
         const yBot = rects[0].y + rects[0].h;
         if (y < yTop || y > yBot)
@@ -1019,7 +1018,7 @@ export default class SpatialOverviewExtension extends Extension {
     //
     // FIXME downstream: upstream sizes the placeholder from its theme node via
     // allocate_preferred_size (workspaceThumbnail.js:1340). That size is meant
-    // for thumbnails; against full-size FIT_ALL workspaces we pick the height
+    // for thumbnails; against full-size FitMode.ALL workspaces we pick the height
     // from the workspace instead.
     _getInsertRect(insertIndex) {
         const {rects} = this._collectWorkspaceRects();
@@ -1136,6 +1135,6 @@ export default class SpatialOverviewExtension extends Extension {
     _isInAppGrid() {
         const controls = this._getControls();
         const params = controls?._stateAdjustment?.getStateTransitionParams?.();
-        return params?.finalState === 2;
+        return params?.finalState === ControlsState.APP_GRID;
     }
 }
