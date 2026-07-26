@@ -956,9 +956,12 @@ export default class SpatialOverviewExtension extends Extension {
             return -1;
         }
         for (const r of rects) {
+            // Exclusive lower bound like upstream (workspaceThumbnail.js:827):
+            // with >= the boundary pixel is claimed by the insert zone and by
+            // this one at the same time.
             const x1 = r.x + WORKSPACE_CUT_SIZE;
             const x2 = r.x + r.w - WORKSPACE_CUT_SIZE;
-            if (x >= x1 && x <= x2 && y >= r.y && y <= r.y + r.h) {
+            if (x > x1 && x <= x2 && y >= r.y && y <= r.y + r.h) {
                 logTime('_getWorkspaceIndexAt: HIT', {
                     wsIndex: r.i,
                     x: Math.round(x), y: Math.round(y),
