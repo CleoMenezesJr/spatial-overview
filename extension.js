@@ -71,6 +71,16 @@ const ZoomOutView = GObject.registerClass({
         // FIXME downstream: replica of the upstream ThumbnailsBox
         // _dropPlaceholder (workspaceThumbnail.js:613). Used to signal
         // "drop here creates a new workspace" in FitMode.ALL.
+        //
+        // Ours is an overlay; upstream allocates its placeholder into the row
+        // so the workspaces visibly open a gap. WorkspacesView.vfunc_allocate
+        // advances every workspace by one uniform spacing
+        // (workspacesView.js:371-386), leaving no per-gap room to allocate
+        // into. Translating the actors instead was tried and reverted: the
+        // hit test reads get_transformed_position, so the zone moved with the
+        // animation and escaped the cursor every frame. Doing it properly
+        // needs the fit-all loop to consult a placeholder position the way
+        // ThumbnailsBox does - which is the upstream change worth asking for.
         this._dropPlaceholder = new St.Bin({
             style_class: 'placeholder',
             visible: false,
