@@ -978,10 +978,11 @@ export default class SpatialOverviewExtension extends Extension {
     // eats into both neighbours instead of being only the bare gap, and it
     // widens by the placeholder's footprint once engaged there.
     //
-    // The widening means something different here: upstream inserts the
-    // placeholder into the ThumbnailsBox layout, pushing thumbnails aside, so
-    // the zone has to grow to stay under the cursor. Our placeholder is an
-    // overlay and nothing reflows, so this is only stickiness.
+    // The widening is not optional padding: upstream allocates the placeholder
+    // into the row, which pushes the workspace right by exactly that much, and
+    // the term is what keeps the zone under the cursor afterwards. Any attempt
+    // to add the reflow here has to keep it, or the zone escapes the cursor,
+    // clears, and re-engages every frame.
     _getInsertWorkspaceIndex(x, y) {
         if (!Meta.prefs_get_dynamic_workspaces())
             return -1;
