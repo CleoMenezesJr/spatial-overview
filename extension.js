@@ -7,7 +7,6 @@ import St from 'gi://St';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as DND from 'resource:///org/gnome/shell/ui/dnd.js';
-import * as WorkspaceThumbnail from 'resource:///org/gnome/shell/ui/workspaceThumbnail.js';
 import {WorkspacesView} from 'resource:///org/gnome/shell/ui/workspacesView.js';
 
 const TAG = '[SPATIAL-WS]';
@@ -227,7 +226,7 @@ export default class SpatialOverviewExtension extends Extension {
         this._dragCancelledId = null;
         this._progressSignalId = null;
 
-        this._patchWindowCloneRestoreOnSuccess();
+        this._patchDraggableCaptureOrigin();
         this._patchFitAllLayout();
 
         this._zoomOutView = new ZoomOutView();
@@ -258,78 +257,71 @@ export default class SpatialOverviewExtension extends Extension {
             });
     }
 
-    _patchWindowCloneRestoreOnSuccess() {
-        if (this._windowClonePatched)
+    // FIXME downstream: _getRestoreLocation (dnd.js:453) reads the drag origin
+    // parent's transformed position at drop time (dnd.js:465-466), when our
+    // zoom-out has already moved it to FIT_ALL. Capture the FIT_SINGLE
+    // transform at gesture recognition instead.
+    // Ideal upstream fix: snapshot the restore location in _gestureRecognized,
+    // where _dragOrigParent/_dragOrigX/Y/Scale are already recorded, or take it
+    // as a makeDraggable() param. Same for _getRealActorScale (dnd.js:54),
+    // private upstream and replicated above.
+    //
+    // _Draggable isn't exported, so reach its prototype via a throwaway
+    // draggable. Patching once here beats hooking a clone constructor, which
+    // re-wraps the prototype per instance and can't be undone.
+    _patchDraggableCaptureOrigin() {
+        if (this._draggablePatched)
             return;
-        const WindowClone = WorkspaceThumbnail.WindowClone;
-        const proto = WindowClone?.prototype;
-        if (!proto) {
-            logTime('WindowClone prototype not found!');
+
+        const dummy = new Clutter.Actor();
+        const dragProto = Object.getPrototypeOf(DND.makeDraggable(dummy));
+        dummy.destroy();
+
+        if (!dragProto?._gestureRecognized) {
+            logTime('_Draggable prototype not found!');
             return;
         }
-        const origInit = proto._init;
-        this._origWindowCloneInit = origInit;
-        const ext = this;
 
         // maps metaWindow -> FIT_SINGLE parent pos+scale for snap-back
         this._fitSingleByMetaWindow = new Map();
 
-        proto._init = function (realWindow) {
-            const r = origInit.call(this, realWindow);
-            try {
-                if (!this._draggable)
-                    return r;
-                this._draggable._restoreOnSuccess = false;
-                // Patch the Draggable's _gestureRecognized once per class to
-                // capture the clone's parent's FIT_SINGLE transform. This is
-                // the only reliable window: before zoom-out, while the clone
-                // is still parented to the workspace view at FIT_SINGLE.
-                const draggable = this._draggable;
-                if (!draggable.__spatialWsPatched) {
-                    draggable.__spatialWsPatched = true;
-                    const dragProto = Object.getPrototypeOf(draggable);
-                    ext._dragProto = dragProto;
-                    const origGR = dragProto._gestureRecognized;
-                    ext._origGestureRecognized = origGR;
-                    dragProto._gestureRecognized = function () {
-                        const r2 = origGR.call(this);
-                        const parent = this._dragOrigParent;
-                        if (parent && !parent.is_destroyed?.()) {
-                            const mw = this.actor?._delegate?.metaWindow
-                                ?? this.actor?.meta_window
-                                ?? this.actor?.metaWindow;
-                            if (mw) {
-                                const [px, py] = parent.get_transformed_position();
-                                const ps = _getRealActorScale(parent);
-                                if (Number.isFinite(px) && Number.isFinite(py))
-                                    ext._fitSingleByMetaWindow.set(mw, {px, py, scale: ps});
-                            }
-                        }
-                        return r2;
-                    };
+        const ext = this;
+        const origGestureRecognized = dragProto._gestureRecognized;
+        this._dragProto = dragProto;
+        this._origGestureRecognized = origGestureRecognized;
+
+        dragProto._gestureRecognized = function () {
+            const result = origGestureRecognized.call(this);
+            // _dragOrigParent is set inside _gestureRecognized (dnd.js:199) and
+            // still holds the FIT_SINGLE transform: our ease was only queued.
+            // dnd.js nulls it on destroy, so get_stage() is all we need to know
+            // the transform is meaningful.
+            const parent = this._dragOrigParent;
+            if (parent?.get_stage()) {
+                const mw = this.actor?._delegate?.metaWindow
+                    ?? this.actor?.meta_window
+                    ?? this.actor?.metaWindow;
+                if (mw) {
+                    const [px, py] = parent.get_transformed_position();
+                    const ps = _getRealActorScale(parent);
+                    if (Number.isFinite(px) && Number.isFinite(py))
+                        ext._fitSingleByMetaWindow.set(mw, {px, py, scale: ps});
                 }
-            } catch (e) {
-                logTime('WindowClone patch error', e.message);
             }
-            return r;
+            return result;
         };
-        this._windowClonePatched = true;
+
+        this._draggablePatched = true;
     }
 
-    _restoreWindowCloneInit() {
-        if (!this._windowClonePatched) return;
-        const WindowClone = WorkspaceThumbnail.WindowClone;
-        const proto = WindowClone?.prototype;
-        if (proto && this._origWindowCloneInit) {
-            proto._init = this._origWindowCloneInit;
-        }
-        if (this._dragProto && this._origGestureRecognized) {
+    _restoreDraggableCaptureOrigin() {
+        if (!this._draggablePatched)
+            return;
+        if (this._dragProto && this._origGestureRecognized)
             this._dragProto._gestureRecognized = this._origGestureRecognized;
-        }
-        this._origWindowCloneInit = null;
         this._origGestureRecognized = null;
         this._dragProto = null;
-        this._windowClonePatched = false;
+        this._draggablePatched = false;
         this._fitSingleByMetaWindow?.clear();
         this._fitSingleByMetaWindow = null;
     }
@@ -520,7 +512,7 @@ export default class SpatialOverviewExtension extends Extension {
         }
 
         this._restoreWorkspacesState();
-        this._restoreWindowCloneInit();
+        this._restoreDraggableCaptureOrigin();
         this._restoreFitAllLayout();
         this._dragActive = false;
 
