@@ -702,15 +702,25 @@ export default class SpatialOverviewExtension extends Extension {
                 view._updateWorkspacesState();
             }
 
-            // FIXME downstream: in GNOME 50.3 WorkspaceLayout.vfunc_allocate
-            // computes window slots using the *container* box (the shrunken
-            // Workspace actor in FitMode.ALL), so a single maximized window fills
-            // the entire shrunk rect (the WINDOW_PREVIEW_MAXIMUM_SCALE = 0.95
-            // cap never kicks in because horizontalScale = containerW/bbW is
-            // already < 0.95). Patch _getWindowSlots + _windowSlotsBox to use
-            // the full workarea-sized box for layout, so slots are computed
-            // at workarea scale and slotsScale (=containerW/workareaW)
-            // properly shrinks them into the Workspace actor.
+            // FIXME downstream: WorkspaceLayout re-runs the layout for whatever
+            // box it is given (workspace.js:677-680), so in FitMode.ALL it
+            // solves the window arrangement inside the shrunken Workspace actor
+            // instead of showing the FitMode.SINGLE arrangement smaller. The
+            // two are not the same picture: computeWindowSlots only ever clamps
+            // (its additionalScale is Math.min(1, ...), workspace.js:317/331),
+            // and the layout it clamps was already solved against the workarea
+            // by _createBestLayout (workspace.js:672), so shrinking the box
+            // re-packs the row rather than scaling it.
+            //
+            // Freeze the FitMode.SINGLE answer instead: pin the box and the
+            // slots upstream computed for it, then hand the same slots back for
+            // the rest of the drag. slotsScale (=containerW/refW,
+            // workspace.js:683) does the miniaturising, so FitMode.ALL is the
+            // fit-single workspace scaled down and nothing re-flows at either
+            // end of the zoom.
+            //
+            // Ideal upstream fix: let a WorkspacesView in FitMode.ALL ask for a
+            // scaled workspace rather than a re-solved one.
             for (const view of ws._workspacesViews ?? []) {
                 for (const w of view._workspaces ?? []) {
                     if (w._origClip === undefined) {
@@ -725,40 +735,39 @@ export default class SpatialOverviewExtension extends Extension {
 
                     const lm = container?.layout_manager;
                     if (lm && lm._origGetWindowSlots === undefined) {
+                        // Upstream already caches this pair for the geometry it
+                        // last allocated, which is the FitMode.SINGLE one:
+                        // _windowSlotsBox is the box it solved for and
+                        // _windowSlots the answer (workspace.js:677-680). Pin
+                        // them rather than recomputing - no second opinion to
+                        // disagree with.
+                        if (!lm._windowSlotsBox || !lm._windowSlots ||
+                            !(lm._windowSlotsBox.get_width() > 0))
+                            continue;
                         lm._origGetWindowSlots = lm._getWindowSlots;
-                        lm._getWindowSlots = function (_containerBox) {
-                            if (!self._spatialLayoutActive()) {
-                                return this._origGetWindowSlots.call(this, _containerBox);
+                        lm._spatialRefBox = lm._windowSlotsBox.copy();
+                        lm._spatialRefLayout = lm._layout;
+                        lm._spatialRefSlots = lm._windowSlots;
+
+                        lm._getWindowSlots = function (containerBox) {
+                            if (!self._spatialLayoutActive() ||
+                                !this._spatialRefSlots)
+                                return this._origGetWindowSlots.call(this, containerBox);
+                            // The pin describes one layout. A drop that adds or
+                            // removes a window rebuilds it (workspace.js:672),
+                            // and re-pinning here would bake in
+                            // _adjustSpacingAndPadding's reading of a container
+                            // transform that is mid-zoom (workspace.js:500-509):
+                            // the wrong y2 clamp, hence a workspace still
+                            // mis-centred after the zoom, with nothing left to
+                            // recompute it. Drop the pin and let upstream solve
+                            // for the live box for the rest of the drag.
+                            if (this._layout !== this._spatialRefLayout) {
+                                this._spatialRefSlots = null;
+                                return this._origGetWindowSlots.call(this, containerBox);
                             }
-                            if (!this._workarea || !this._layoutStrategy ||
-                                !this._layout) {
-                                const slots =
-                                    this._origGetWindowSlots.call(this, _containerBox);
-                                if (!this._windowSlotsBox && _containerBox)
-                                    this._windowSlotsBox = _containerBox;
-                                return slots;
-                            }
-                            // Bypass _adjustSpacingAndPadding which
-                            // shrinks the box based on monitor/stage
-                            // placements meaningless in FitMode.ALL. Use the
-                            // full workarea-sized box directly so the
-                            // WINDOW_PREVIEW_MAXIMUM_SCALE = 0.95 cap
-                            // kicks in and slots fill ~95% of workarea.
-                            const workareaBox = new Clutter.ActorBox();
-                            workareaBox.set_origin(0, 0);
-                            workareaBox.set_size(this._workarea.width,
-                                this._workarea.height);
-                            const availArea = {
-                                x: 0,
-                                y: 0,
-                                width: this._workarea.width,
-                                height: this._workarea.height,
-                            };
-                            const slots =
-                                this._layoutStrategy.computeWindowSlots(
-                                    this._layout, availArea);
-                            this._windowSlotsBox = workareaBox;
-                            return slots;
+                            this._windowSlotsBox = this._spatialRefBox;
+                            return this._spatialRefSlots;
                         };
                     }
                 }
@@ -1217,6 +1226,9 @@ export default class SpatialOverviewExtension extends Extension {
                 if (lm && lm._origGetWindowSlots !== undefined) {
                     lm._getWindowSlots = lm._origGetWindowSlots;
                     lm._origGetWindowSlots = undefined;
+                    lm._spatialRefBox = undefined;
+                    lm._spatialRefSlots = undefined;
+                    lm._spatialRefLayout = undefined;
                 }
             }
         }
