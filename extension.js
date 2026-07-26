@@ -17,6 +17,7 @@ const logTime = DEBUG
     : () => {};
 const ZOOM_OUT_DURATION = 400;
 const ZOOM_IN_DURATION = 400;
+const ZOOM_OUT_HOLD_DELAY = 300;
 const BACKDROP_OPACITY = 180;
 const MIN_WS_SCALE = 0.18;
 const WORKSPACE_CUT_SIZE = 10; // workspaceThumbnail.js:27
@@ -229,6 +230,7 @@ export default class SpatialOverviewExtension extends Extension {
         this._dragCancelledId = null;
         this._progressSignalId = null;
         this._restoreIdleId = 0;
+        this._engageTimeoutId = 0;
         this._spatialEngaged = false;
         this._dropInsertIndex = -1;
         this._dropWorkspaceIndex = -1;
@@ -526,6 +528,7 @@ export default class SpatialOverviewExtension extends Extension {
         }
 
         this._removeRestoreIdle();
+        this._removeEngageTimeout();
         this._spatialEngaged = false;
         this._restoreWorkspacesState();
         this._restoreDraggableCaptureOrigin();
@@ -539,7 +542,7 @@ export default class SpatialOverviewExtension extends Extension {
     }
 
     _onDragBegin(metaWindow) {
-        logTime('_onDragBegin ENTER (zoom-out will start)');
+        logTime('_onDragBegin ENTER (zoom-out held back)');
         this._dragActive = true;
         const self = this;
         this._draggedMetaWindow = metaWindow;
@@ -607,6 +610,24 @@ export default class SpatialOverviewExtension extends Extension {
             dragDrop: undefined,
         };
         DND.addDragMonitor(this._dragMonitor);
+
+        // Deferring the monitor along with it would lose the capture: the
+        // draggable and its restore location are read on the first motion
+        // event. Until _engageSpatialLayout runs the ZoomOutView stays hidden,
+        // so a drag released within the delay never reaches our acceptDrop and
+        // the drop falls through to upstream.
+        this._removeEngageTimeout();
+        this._engageTimeoutId = GLib.timeout_add(
+            GLib.PRIORITY_DEFAULT, ZOOM_OUT_HOLD_DELAY, () => {
+                this._engageTimeoutId = 0;
+                this._engageSpatialLayout();
+                return GLib.SOURCE_REMOVE;
+            });
+    }
+
+    _engageSpatialLayout() {
+        logTime('_engageSpatialLayout ENTER (zoom-out will start)');
+        const self = this;
 
         const controls = this._getControls();
         if (controls) {
@@ -815,9 +836,13 @@ export default class SpatialOverviewExtension extends Extension {
         }
         this._dragActive = false;
 
+        const heldBack = this._engageTimeoutId !== 0;
+        this._removeEngageTimeout();
+
         logTime('_onDragEnd START', {
             dragMotionTotal: this._dragMotionCount,
             isCancel,
+            heldBack,
             dropWasNoop: !!this._dropWasNoop,
         });
         this._dropWasNoop = false;
@@ -868,7 +893,7 @@ export default class SpatialOverviewExtension extends Extension {
             }
         }
 
-        if (this._zoomOutView)
+        if (this._zoomOutView?.visible)
             this._zoomOutView.hide();
     }
 
@@ -876,6 +901,13 @@ export default class SpatialOverviewExtension extends Extension {
         if (this._restoreIdleId) {
             GLib.source_remove(this._restoreIdleId);
             this._restoreIdleId = 0;
+        }
+    }
+
+    _removeEngageTimeout() {
+        if (this._engageTimeoutId) {
+            GLib.source_remove(this._engageTimeoutId);
+            this._engageTimeoutId = 0;
         }
     }
 
