@@ -894,8 +894,15 @@ export default class SpatialOverviewExtension extends Extension {
         this._clearDragPlaceholder();
 
         const ws = this._getWsDisplay();
-        const alreadyChanged = ws?._fitModeAdjustment?.value === FitMode.SINGLE;
-        if (!alreadyChanged && ws?._fitModeAdjustment && this._spatialLayoutActive()) {
+        // Not value alone: a drop landing within a frame of _engageSpatialLayout
+        // finds the ease to FitMode.ALL queued but not yet advanced, so the
+        // value still reads exactly SINGLE while a zoom-out is in flight.
+        // Taking the no-op branch there left that ease running with nothing to
+        // undo it, stranding the overview in fit-all.
+        const fitAdj = ws?._fitModeAdjustment;
+        const alreadyChanged = fitAdj?.value === FitMode.SINGLE &&
+            !fitAdj?.get_transition('value');
+        if (!alreadyChanged && fitAdj && this._spatialLayoutActive()) {
             logTime('_onDragEnd: starting zoom-in ease to FitMode.SINGLE', {isCancel});
             ws._fitModeAdjustment.remove_transition('value');
             ws._fitModeAdjustment.ease(FitMode.SINGLE, {
