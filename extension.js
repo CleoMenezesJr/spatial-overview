@@ -586,10 +586,46 @@ export default class SpatialOverviewExtension extends Extension {
                         }
                         return self._origGetRestoreLocation.call(this);
                     };
+                    // FIXME downstream: the endpoint is only half of the
+                    // snap-back. _cancelDrag eases for SNAP_BACK_ANIMATION_TIME
+                    // (dnd.js:611), and when that ease stops
+                    // _onAnimationComplete (dnd.js:518) reparents the clone into
+                    // _dragOrigParent and clears its fixed position. From there
+                    // WorkspaceLayout owns it, and it allocates previews rather
+                    // than transforming a container (workspace.js:694-769) - so
+                    // a snap-back ending before our zoom-in hands the clone to a
+                    // parent still in motion, and it drops onto the slot the
+                    // zoom-in has reached instead of the endpoint it was eased
+                    // to.
+                    //
+                    // Both eases use EASE_OUT_QUAD and are created in the same
+                    // frame, so equal durations put the handoff on the value the
+                    // ease already reached. Ideal upstream fix: let the drag
+                    // origin own the snap-back - endpoint and clock - which is
+                    // the same gap _getRestoreLocation above works around.
+                    this._origAnimateDragEnd = draggable._animateDragEnd;
+                    draggable._animateDragEnd = function (eventTime, params) {
+                        // _spatialEngaged is already false when the drop landed
+                        // inside ZOOM_OUT_HOLD_DELAY: _onDragEnd cleared it and
+                        // there is no zoom-in to wait for. The duration test
+                        // leaves the restoreOnSuccess path alone - it reaches
+                        // here too, on REVERT_ANIMATION_TIME (dnd.js:489).
+                        if (self._spatialEngaged &&
+                            params.duration === DND.SNAP_BACK_ANIMATION_TIME) {
+                            logTime('snap-back retimed', {
+                                duration: ZOOM_IN_DURATION,
+                            });
+                            params = {...params, duration: ZOOM_IN_DURATION};
+                        }
+                        return self._origAnimateDragEnd.call(
+                            this, eventTime, params);
+                    };
                     const restoreId = draggable.connect('drag-end', () => {
                         draggable._getRestoreLocation =
                             self._origGetRestoreLocation;
+                        draggable._animateDragEnd = self._origAnimateDragEnd;
                         self._origGetRestoreLocation = null;
+                        self._origAnimateDragEnd = null;
                         self._fitSingleParent = null;
                         draggable.disconnect(restoreId);
                     });
