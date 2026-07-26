@@ -20,6 +20,8 @@ const BACKDROP_OPACITY = 180;
 const FIT_ALL = 1;
 const FIT_SINGLE = 0;
 const MIN_WS_SCALE = 0.18;
+const WORKSPACE_CUT_SIZE = 10; // workspaceThumbnail.js:27
+const PLACEHOLDER_WIDTH = 24;
 
 // Replicates _getRealActorScale from dnd.js (not exported upstream).
 // Walks up the actor tree multiplying scale_x - needed to compute
@@ -162,13 +164,23 @@ const ZoomOutView = GObject.registerClass({
         // FIXME downstream: in GNOME upstream, only the ThumbnailsBox uses
         // _dropPlaceholder + insertWorkspace. We extend the same semantics
         // onto the main WorkspacesView in FitMode.ALL via this extension.
+        //
+        // Like ThumbnailsBox.handleDragOver (workspaceThumbnail.js:831), this
+        // is where the drop target is decided; acceptDrop only consumes it.
+        // The two can't be allowed to recompute independently: hover runs off
+        // a coalesced idle over motion coordinates (dnd.js:364-370) and its
+        // last queued pass is dropped unrun by _dragComplete (dnd.js:545-548),
+        // while acceptDrop sees the button-release coordinates (dnd.js:386).
         const isWindow = !!source?.metaWindow;
+        this._extension._dropWorkspaceIndex = -1;
+
         const insertIndex =
             this._extension._getInsertWorkspaceIndex(x, y);
         if (insertIndex >= 0) {
             const rect =
                 this._extension._getInsertRect(insertIndex);
             if (rect) {
+                this._extension._dropInsertIndex = insertIndex;
                 this.setDropPlaceholderRect(rect);
                 logTime('VIEW.handleDragOver => INSERT',
                     {insertIndex, x, y, rect});
@@ -179,8 +191,9 @@ const ZoomOutView = GObject.registerClass({
         }
 
         // No insert zone: clear placeholder, then try existing-workspace drop.
-        this.setDropPlaceholderRect(null);
+        this._extension._clearDragPlaceholder();
         const wsIndex = this._extension._getWorkspaceIndexAt(x, y);
+        this._extension._dropWorkspaceIndex = wsIndex;
         if (wsIndex < 0) {
             logTime('VIEW.handleDragOver => CONTINUE (wsIndex < 0)', x, y);
             return DND.DragMotionResult.CONTINUE;
@@ -207,6 +220,8 @@ export default class SpatialOverviewExtension extends Extension {
         this._dragCancelledId = null;
         this._progressSignalId = null;
         this._restoreIdleId = 0;
+        this._dropInsertIndex = -1;
+        this._dropWorkspaceIndex = -1;
 
         this._patchDraggableCaptureOrigin();
         this._patchFitAllLayout();
@@ -523,6 +538,8 @@ export default class SpatialOverviewExtension extends Extension {
         this._lastCursorY = 0;
         this._dragMotionCount = 0;
         this._activeDraggable = null;
+        this._dropInsertIndex = -1;
+        this._dropWorkspaceIndex = -1;
 
         this._dragMonitor = {
             dragMotion: (dragEvent) => {
@@ -694,28 +711,28 @@ export default class SpatialOverviewExtension extends Extension {
         if (!metaWindow) {
             logTime('_handleDrop: NO metaWindow -> skip');
             this._dropWasNoop = true;
-            this._hideDropPlaceholder();
+            this._clearDragPlaceholder();
             return false;
         }
 
         // FIXME downstream: create-new-workspace-via-drop replica of
         // ThumbnailsBox.acceptDrop (workspaceThumbnail.js:877-920).
         // Upstream WorkspacesView has no drop-to-create path.
-        if (this._zoomOutView?._dropPlaceholder?.visible) {
-            const insertIndex = this._getInsertWorkspaceIndex(x, y);
-            if (insertIndex >= 0) {
-                logTime('_handleDrop: insert workspace at', insertIndex);
-                this._createWorkspaceAt(insertIndex, metaWindow);
-                this._hideDropPlaceholder();
-                return true;
-            }
+        //
+        // Consumes what handleDragOver decided, like upstream acceptDrop; x/y
+        // are logged but never re-tested. See the note there.
+        const {_dropInsertIndex: insertIndex, _dropWorkspaceIndex: wsIndex} = this;
+        this._clearDragPlaceholder();
+
+        if (insertIndex >= 0) {
+            logTime('_handleDrop: insert workspace at', insertIndex);
+            this._createWorkspaceAt(insertIndex, metaWindow);
+            return true;
         }
 
-        const wsIndex = this._getWorkspaceIndexAt(x, y);
         if (wsIndex < 0) {
             logTime('_handleDrop: outside any workspace -> skip (no anim)');
             this._dropWasNoop = true;
-            this._hideDropPlaceholder();
             return false;
         }
         const targetWs = global.workspace_manager.get_workspace_by_index(wsIndex);
@@ -723,7 +740,6 @@ export default class SpatialOverviewExtension extends Extension {
         if (currentWs === targetWs) {
             logTime('_handleDrop: same workspace -> skip (no anim)');
             this._dropWasNoop = true;
-            this._hideDropPlaceholder();
             return false;
         }
         logTime('_handleDrop: change_workspace CALLED', {
@@ -732,7 +748,6 @@ export default class SpatialOverviewExtension extends Extension {
             title: metaWindow.get_title?.() ?? '?',
         });
         metaWindow.change_workspace(targetWs);
-        this._hideDropPlaceholder();
         // Don't snap fitModeAdjustment here - _onDragEnd (triggered
         // synchronously by change_workspace -> window-drag-end signal)
         // owns the zoom-in ease. Snapping here would remove_transition
@@ -770,9 +785,14 @@ export default class SpatialOverviewExtension extends Extension {
         logTime('_createWorkspaceAt DONE', {index});
     }
 
-    _hideDropPlaceholder() {
-        if (this._zoomOutView)
-            this._zoomOutView.setDropPlaceholderRect(null);
+    // Mirrors ThumbnailsBox._clearDragPlaceholder
+    // (workspaceThumbnail.js:764-770), early return included.
+    _clearDragPlaceholder() {
+        if (this._dropInsertIndex === -1)
+            return;
+
+        this._dropInsertIndex = -1;
+        this._zoomOutView?.setDropPlaceholderRect(null);
     }
 
     _onDragEnd(isCancel = false) {
@@ -795,10 +815,9 @@ export default class SpatialOverviewExtension extends Extension {
         }
         this._draggedMetaWindow = null;
 
-        // FIXME downstream: always clear the insertion placeholder on drag
-        // end/cancel, mirroring ThumbnailsBox._clearDragPlaceholder
-        // (workspaceThumbnail.js:764-770).
-        this._hideDropPlaceholder();
+        // Same point upstream clears it: _endDrag (workspaceThumbnail.js:748),
+        // reached from _onDragEnd and _onDragCancelled.
+        this._clearDragPlaceholder();
 
         const ws = this._getWsDisplay();
         const inAppGrid = this._isInAppGrid();
@@ -849,11 +868,17 @@ export default class SpatialOverviewExtension extends Extension {
     //
     // Both _getWorkspaceIndexAt and _getInsertWorkspaceIndex consume the same
     // sorted rect array built by _collectWorkspaceRects().
+    //
+    // Rects come out in ZoomOutView-local coordinates: dnd.js hands
+    // handleDragOver/acceptDrop a point already run through
+    // target.transform_stage_point (dnd.js:344, 419), and vfunc_allocate
+    // places the placeholder in the same space.
     _collectWorkspaceRects() {
         const mon = Main.layoutManager.monitors[
             Main.layoutManager.primaryIndex];
-        if (!mon)
-            return {rects: [], monitor: null};
+        const view = this._zoomOutView;
+        if (!mon || !view)
+            return {rects: [], monitor: null, spacing: 0};
 
         const display = this._getWsDisplay();
         let workspaces = null;
@@ -870,7 +895,7 @@ export default class SpatialOverviewExtension extends Extension {
         if (!workspaces && wsView?._workspaces)
             workspaces = wsView._workspaces;
         if (!workspaces || workspaces.length === 0)
-            return {rects: [], monitor: mon};
+            return {rects: [], monitor: mon, spacing: 0};
 
         const rects = [];
         for (let i = 0; i < workspaces.length; i++) {
@@ -881,16 +906,29 @@ export default class SpatialOverviewExtension extends Extension {
             const [ww, wh] = wsActor.get_transformed_size();
             if (ww <= 1 || wh <= 1)
                 continue;
+            const [okTL, lx, ly] = view.transform_stage_point(wx, wy);
+            const [okBR, rx, ry] = view.transform_stage_point(wx + ww, wy + wh);
+            if (!okTL || !okBR)
+                continue;
             rects.push({
                 i: wsActor.metaWorkspace.index(),
-                x: Math.round(wx), y: Math.round(wy),
-                w: Math.round(ww), h: Math.round(wh),
+                x: Math.round(lx), y: Math.round(ly),
+                w: Math.round(rx - lx), h: Math.round(ry - ly),
             });
         }
         rects.sort((a, b) => a.i - b.i);
-        return {rects, monitor: mon};
+
+        // Measured off the rects, not read from a theme node: our patched
+        // _getSpacing is what produced this layout.
+        const spacing = rects.length > 1
+            ? Math.max(0, rects[1].x - (rects[0].x + rects[0].w))
+            : 0;
+        return {rects, monitor: mon, spacing};
     }
 
+    // The horizontal cut mirrors upstream _withinWorkspace
+    // (workspaceThumbnail.js:812-828): the outer WORKSPACE_CUT_SIZE of each
+    // workspace belongs to the neighbouring insert zone, not to the workspace.
     _getWorkspaceIndexAt(x, y) {
         const {rects, monitor} = this._collectWorkspaceRects();
         if (!monitor || rects.length === 0) {
@@ -899,11 +937,10 @@ export default class SpatialOverviewExtension extends Extension {
             });
             return -1;
         }
-        if (x < 0 || x > monitor.width || y < 0 || y > monitor.height) {
-            return -1;
-        }
         for (const r of rects) {
-            if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) {
+            const x1 = r.x + WORKSPACE_CUT_SIZE;
+            const x2 = r.x + r.w - WORKSPACE_CUT_SIZE;
+            if (x >= x1 && x <= x2 && y >= r.y && y <= r.y + r.h) {
                 logTime('_getWorkspaceIndexAt: HIT', {
                     wsIndex: r.i,
                     x: Math.round(x), y: Math.round(y),
@@ -927,13 +964,21 @@ export default class SpatialOverviewExtension extends Extension {
     // Gated by Meta.prefs_get_dynamic_workspaces() - same condition the
     // upstream thumbnails check enforces (workspaceThumbnail.js:836).
     // Returns -1 when dynamic workspaces are off, mirroring upstream.
+    //
+    // Zone geometry follows _getPlaceholderTarget (workspaceThumbnail.js:780):
+    // the zone before workspace k spans [k.x - spacing - CUT, k.x + CUT], so it
+    // eats into both neighbours instead of being only the bare gap, and it
+    // widens by the placeholder's footprint once engaged there.
+    //
+    // The widening means something different here: upstream inserts the
+    // placeholder into the ThumbnailsBox layout, pushing thumbnails aside, so
+    // the zone has to grow to stay under the cursor. Our placeholder is an
+    // overlay and nothing reflows, so this is only stickiness.
     _getInsertWorkspaceIndex(x, y) {
         if (!Meta.prefs_get_dynamic_workspaces())
             return -1;
-        const {rects, monitor} = this._collectWorkspaceRects();
-        if (!monitor || rects.length === 0)
-            return -1;
-        if (x < 0 || x > monitor.width || y < 0 || y > monitor.height)
+        const {rects, spacing} = this._collectWorkspaceRects();
+        if (rects.length === 0)
             return -1;
 
         // Use the first rect's y-band as a shared vertical band - works
@@ -943,37 +988,44 @@ export default class SpatialOverviewExtension extends Extension {
         if (y < yTop || y > yBot)
             return -1;
 
-        // Before first workspace
-        if (rects[0].x > 0 && x < rects[0].x)
-            return rects[0].i;
-        // After last workspace
-        const last = rects[rects.length - 1];
-        if (x > last.x + last.w)
-            return last.i + 1;
-        // Between two consecutive workspaces
-        for (let k = 0; k < rects.length - 1; k++) {
-            const left = rects[k];
-            const right = rects[k + 1];
-            const gapStart = left.x + left.w;
-            const gapEnd = right.x;
-            if (x > gapStart && x < gapEnd)
-                return right.i;
+        const engaged = this._dropInsertIndex;
+        for (let k = 0; k < rects.length; k++) {
+            const r = rects[k];
+            let x1 = r.x - spacing - WORKSPACE_CUT_SIZE;
+            const x2 = r.x + WORKSPACE_CUT_SIZE;
+            // Nothing to the left of the first workspace to cut into.
+            if (k === 0)
+                x1 += spacing + WORKSPACE_CUT_SIZE;
+            if (r.i === engaged)
+                x1 -= PLACEHOLDER_WIDTH + spacing;
+            if (x > x1 && x <= x2)
+                return r.i;
         }
+
+        // FIXME downstream: upstream has no insert-after-last zone - its loop
+        // only builds insert-before zones (workspaceThumbnail.js:845-856).
+        const last = rects[rects.length - 1];
+        let afterX1 = last.x + last.w - WORKSPACE_CUT_SIZE;
+        if (last.i + 1 === engaged)
+            afterX1 -= PLACEHOLDER_WIDTH + spacing;
+        if (x > afterX1)
+            return last.i + 1;
+
         return -1;
     }
 
-    // Returns the rect metadata for visual placement of the placeholder
-    // when an insert cursor is at `insertIndex`. Dimensions match the
-    // upstream thumbnails placeholder: 18px wide, 32px tall (from
-    // gnome-shell-theme .placeholder CSS + workspace-placeholder.svg).
-    // The placeholder is vertically centered in the gap between
-    // workspace panels, mirroring upstream ThumbnailsBox vfunc_allocate
-    // (workspaceThumbnail.js:1365-1390).
+    // Returns the rect for the placeholder when the insert cursor is at
+    // `insertIndex`, centered in the gap between workspace panels.
+    //
+    // FIXME downstream: upstream sizes the placeholder from its theme node via
+    // allocate_preferred_size (workspaceThumbnail.js:1340). That size is meant
+    // for thumbnails; against full-size FIT_ALL workspaces we pick the height
+    // from the workspace instead.
     _getInsertRect(insertIndex) {
         const {rects} = this._collectWorkspaceRects();
         if (rects.length === 0)
             return null;
-        const PH_W = 24;
+        const PH_W = PLACEHOLDER_WIDTH;
         const PH_H = Math.round(rects[0].h / 3);
         if (insertIndex <= rects[0].i) {
             const wsH = rects[0].h;
