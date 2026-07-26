@@ -621,6 +621,7 @@ export default class SpatialOverviewExtension extends Extension {
                             this, eventTime, params);
                     };
                     const restoreId = draggable.connect('drag-end', () => {
+                        self._reattachDetachedSlots();
                         draggable._getRestoreLocation =
                             self._origGetRestoreLocation;
                         draggable._animateDragEnd = self._origAnimateDragEnd;
@@ -748,6 +749,26 @@ export default class SpatialOverviewExtension extends Extension {
                         lm._spatialRefBox = lm._windowSlotsBox.copy();
                         lm._spatialRefLayout = lm._layout;
                         lm._spatialRefSlots = lm._windowSlots;
+
+                        // FIXME downstream: a preview being dragged keeps its
+                        // slot - removeWindow (workspace.js:853) says as much,
+                        // "the window might have been reparented by DND" - so
+                        // vfunc_allocate keeps calling child.allocate() on an
+                        // actor that now lives in Main.uiGroup. The slot box is
+                        // container-local, so it lands somewhere else entirely,
+                        // and the clone only snaps back under the pointer on
+                        // the next motion event, when dnd re-asserts its fixed
+                        // position. Upstream never sees this because nothing
+                        // relayouts a workspace mid-drag; the zoom does it every
+                        // frame. Ideal upstream fix: skip slots whose actor the
+                        // container no longer parents.
+                        lm._spatialDetached = [];
+                        for (let i = lm._windowSlots.length - 1; i >= 0; i--) {
+                            if (lm._windowSlots[i][4].get_parent() === container)
+                                continue;
+                            lm._spatialDetached.push([i, lm._windowSlots[i]]);
+                            lm._windowSlots.splice(i, 1);
+                        }
 
                         lm._getWindowSlots = function (containerBox) {
                             if (!self._spatialLayoutActive() ||
@@ -947,6 +968,39 @@ export default class SpatialOverviewExtension extends Extension {
 
         if (this._zoomOutView?.visible)
             this._zoomOutView.hide();
+    }
+
+    // Gives back the slots dropped at engagement, once the container owns the
+    // actor again. dnd reparents in _onAnimationComplete (dnd.js:518-521) and
+    // emits drag-end straight after, so the slot is back before the frame that
+    // follows the handoff. Entries whose actor never came back - a
+    // cross-workspace drop destroys the preview instead - are left for
+    // _restoreWorkspacesState to discard.
+    _reattachDetachedSlots() {
+        for (const view of this._getWsDisplay()?._workspacesViews ?? []) {
+            for (const w of view._workspaces ?? []) {
+                const container = w._container;
+                const lm = container?.layout_manager;
+                if (!lm?._spatialDetached?.length)
+                    continue;
+                // Pin dropped: upstream is solving for the live box again and
+                // _windowSlots is its array, not ours to splice into. It also
+                // rebuilt the layout, so the returning preview gets a slot on
+                // its own.
+                if (!lm._spatialRefSlots) {
+                    lm._spatialDetached = [];
+                    continue;
+                }
+                lm._spatialDetached = lm._spatialDetached.filter(([i, slot]) => {
+                    if (slot[4].get_parent() !== container)
+                        return true;
+                    lm._windowSlots.splice(
+                        Math.min(i, lm._windowSlots.length), 0, slot);
+                    return false;
+                });
+                container.queue_relayout();
+            }
+        }
     }
 
     _removeRestoreIdle() {
@@ -1205,6 +1259,7 @@ export default class SpatialOverviewExtension extends Extension {
     }
 
     _restoreWorkspacesState() {
+        this._reattachDetachedSlots();
         const ws = this._getWsDisplay();
         for (const view of ws?._workspacesViews ?? []) {
             if (view._origUpdateWorkspacesState) {
@@ -1229,6 +1284,7 @@ export default class SpatialOverviewExtension extends Extension {
                     lm._spatialRefBox = undefined;
                     lm._spatialRefSlots = undefined;
                     lm._spatialRefLayout = undefined;
+                    lm._spatialDetached = undefined;
                 }
             }
         }
