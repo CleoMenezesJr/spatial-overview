@@ -219,6 +219,7 @@ export default class SpatialOverviewExtension extends Extension {
         this._dragCancelledId = null;
         this._progressSignalId = null;
         this._restoreIdleId = 0;
+        this._spatialEngaged = false;
         this._dropInsertIndex = -1;
         this._dropWorkspaceIndex = -1;
 
@@ -397,8 +398,7 @@ export default class SpatialOverviewExtension extends Extension {
         };
 
         proto._getSpacing = function (box, fitMode, vertical) {
-            // Delegate to original for non-ALL modes or when in app grid.
-            if (fitMode !== FitMode.ALL || self._isInAppGrid())
+            if (fitMode !== FitMode.ALL || !self._spatialLayoutActive())
                 return origGetSpacing.call(this, box, fitMode, vertical);
 
             const [width, height] = box.get_size();
@@ -420,7 +420,7 @@ export default class SpatialOverviewExtension extends Extension {
         };
 
         proto._getFirstFitAllWorkspaceBox = function (box, spacing, vertical) {
-            if (self._isInAppGrid())
+            if (!self._spatialLayoutActive())
                 return self._origGetFirstFitAllWorkspaceBox.call(this, box, spacing, vertical);
 
             const {nWorkspaces} = global.workspaceManager;
@@ -516,6 +516,7 @@ export default class SpatialOverviewExtension extends Extension {
         }
 
         this._removeRestoreIdle();
+        this._spatialEngaged = false;
         this._restoreWorkspacesState();
         this._restoreDraggableCaptureOrigin();
         this._restoreFitAllLayout();
@@ -600,7 +601,10 @@ export default class SpatialOverviewExtension extends Extension {
         const controls = this._getControls();
         if (controls) {
             const ws = controls._workspacesDisplay;
+            // The one place the app grid decides anything: whether we engage
+            // at all. Everything downstream of here asks _spatialLayoutActive.
             if (ws?._fitModeAdjustment && !self._isInAppGrid()) {
+                this._spatialEngaged = true;
                 ws._fitModeAdjustment.remove_transition('value');
                 ws._fitModeAdjustment.ease(FitMode.ALL, {
                     duration: ZOOM_OUT_DURATION,
@@ -623,7 +627,7 @@ export default class SpatialOverviewExtension extends Extension {
                 const origFn = view._origUpdateWorkspacesState;
                 view._updateWorkspacesState = function () {
                     origFn?.call(this);
-                    if (!self._isInAppGrid()) {
+                    if (self._spatialLayoutActive()) {
                         for (const w of this._workspaces ?? [])
                             w.stateAdjustment.value = 1;
                     }
@@ -656,7 +660,7 @@ export default class SpatialOverviewExtension extends Extension {
                     if (lm && lm._origGetWindowSlots === undefined) {
                         lm._origGetWindowSlots = lm._getWindowSlots;
                         lm._getWindowSlots = function (_containerBox) {
-                            if (self._isInAppGrid()) {
+                            if (!self._spatialLayoutActive()) {
                                 return this._origGetWindowSlots.call(this, _containerBox);
                             }
                             if (!this._workarea || !this._layoutStrategy ||
@@ -819,15 +823,17 @@ export default class SpatialOverviewExtension extends Extension {
         this._clearDragPlaceholder();
 
         const ws = this._getWsDisplay();
-        const inAppGrid = this._isInAppGrid();
         const alreadyChanged = ws?._fitModeAdjustment?.value === FitMode.SINGLE;
-        if (!alreadyChanged && ws?._fitModeAdjustment && !inAppGrid) {
+        if (!alreadyChanged && ws?._fitModeAdjustment && this._spatialLayoutActive()) {
             logTime('_onDragEnd: starting zoom-in ease to FitMode.SINGLE', {isCancel});
             ws._fitModeAdjustment.remove_transition('value');
             ws._fitModeAdjustment.ease(FitMode.SINGLE, {
                 duration: ZOOM_IN_DURATION,
                 mode: Clutter.AnimationMode.EASE_OUT_QUAD,
                 onStopped: () => {
+                    // Not earlier: the ease allocates on every frame, and each
+                    // allocation asks _spatialLayoutActive.
+                    this._spatialEngaged = false;
                     this._removeRestoreIdle();
                     this._restoreIdleId = GLib.idle_add(
                         GLib.PRIORITY_DEFAULT, () => {
@@ -838,7 +844,10 @@ export default class SpatialOverviewExtension extends Extension {
                 },
             });
         } else {
-            logTime('_onDragEnd: fitMode already FitMode.SINGLE or inAppGrid, no zoom-in', {isCancel, inAppGrid});
+            logTime('_onDragEnd: no zoom-in', {
+                isCancel, engaged: this._spatialEngaged,
+            });
+            this._spatialEngaged = false;
             this._restoreWorkspacesState();
         }
 
@@ -1136,5 +1145,11 @@ export default class SpatialOverviewExtension extends Extension {
         const controls = this._getControls();
         const params = controls?._stateAdjustment?.getStateTransitionParams?.();
         return params?.finalState === ControlsState.APP_GRID;
+    }
+
+    // _spatialEngaged alone is not enough: the overview can transition into the
+    // app grid mid-drag, and the layout patches have to yield when it does.
+    _spatialLayoutActive() {
+        return this._spatialEngaged && !this._isInAppGrid();
     }
 }
