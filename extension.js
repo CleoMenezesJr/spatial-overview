@@ -229,6 +229,8 @@ export default class SpatialOverviewExtension extends Extension {
         this._dragEndId = null;
         this._dragCancelledId = null;
         this._progressSignalId = null;
+        this._fitModeNotifyId = 0;
+        this._fitModeNotifyAdj = null;
         this._restoreIdleId = 0;
         this._engageTimeoutId = 0;
         this._spatialEngaged = false;
@@ -527,6 +529,7 @@ export default class SpatialOverviewExtension extends Extension {
             this._dragCancelledId = null;
         }
 
+        this._disconnectFitModeNotify();
         this._removeRestoreIdle();
         this._removeEngageTimeout();
         this._spatialEngaged = false;
@@ -674,6 +677,27 @@ export default class SpatialOverviewExtension extends Extension {
             if (ws?._fitModeAdjustment && !self._isInAppGrid()) {
                 this._spatialEngaged = true;
                 ws._fitModeAdjustment.remove_transition('value');
+
+                // FIXME downstream: _updateDragPosition (dnd.js:373-382) is the
+                // only thing that ever queues a re-pick, so dnd re-reads the
+                // drop target when the pointer moves and at no other time. A
+                // workspace that slides under a still cursor is therefore never
+                // offered: the cursor keeps its NO_DROP, and _dropWorkspaceIndex
+                // still holds the -1 from the last handleDragOver pass, so
+                // acceptDrop refuses and dnd cancels the drag. Upstream never
+                // sees it because nothing moves a drop target mid-drag; the zoom
+                // moves every one of them, so re-pick on each of its frames.
+                //
+                // Re-testing acceptDrop's own x/y instead would break the
+                // invariant handleDragOver documents - hover decides, acceptDrop
+                // consumes - and it is the hover that is stale here anyway.
+                //
+                // Ideal upstream fix: let a drop target invalidate the hover
+                // when its geometry changes under the pointer.
+                this._fitModeNotifyAdj = ws._fitModeAdjustment;
+                this._fitModeNotifyId = this._fitModeNotifyAdj.connect(
+                    'notify::value', () => this._revalidateDragHover());
+
                 ws._fitModeAdjustment.ease(FitMode.ALL, {
                     duration: ZOOM_OUT_DURATION,
                     mode: Clutter.AnimationMode.EASE_OUT_QUAD,
@@ -895,12 +919,41 @@ export default class SpatialOverviewExtension extends Extension {
         this._zoomOutView?.setDropPlaceholderRect(null);
     }
 
+    // _queueUpdateDragHover coalesces onto a single idle (dnd.js:364-372), so
+    // one call per frame of the zoom costs one pick.
+    //
+    // Both guards are load-bearing. _dragActive is already false while the
+    // snap-back runs - dnd emits drag-end from _onAnimationComplete and only
+    // reaches _dragComplete afterwards (dnd.js:518-529) - so it is what keeps
+    // the zoom-in from re-picking for a drag that is over. _dragActor is what
+    // _pickTargetActor dereferences (dnd.js:302) and _dragComplete nulls it
+    // (dnd.js:553), so queueing past that point throws on the idle.
+    _revalidateDragHover() {
+        if (!this._dragActive)
+            return;
+        const draggable = this._activeDraggable;
+        if (draggable?._dragActor)
+            draggable._queueUpdateDragHover();
+    }
+
+    _disconnectFitModeNotify() {
+        if (!this._fitModeNotifyId)
+            return;
+        this._fitModeNotifyAdj?.disconnect(this._fitModeNotifyId);
+        this._fitModeNotifyId = 0;
+        this._fitModeNotifyAdj = null;
+    }
+
     _onDragEnd(isCancel = false) {
         if (!this._dragActive) {
             logTime('_onDragEnd: not active (already ended?) -> skip');
             return;
         }
         this._dragActive = false;
+        // Connected per engage, so it has to go per drag: the adjustment is the
+        // shell's own and outlives us, and the next engage would connect a
+        // second handler onto it rather than replace this one.
+        this._disconnectFitModeNotify();
 
         const heldBack = this._engageTimeoutId !== 0;
         this._removeEngageTimeout();
