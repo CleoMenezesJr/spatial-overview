@@ -10,35 +10,16 @@ import * as DND from 'resource:///org/gnome/shell/ui/dnd.js';
 import {WorkspacesView} from 'resource:///org/gnome/shell/ui/workspacesView.js';
 
 const TAG = '[SPATIAL-WS]';
-const logTime = (...a) => console.log(TAG, `t=${(Date.now() % 100000)}`, ...a);
+const DEBUG = GLib.getenv('SPATIAL_WS_DEBUG') !== null;
+const logTime = DEBUG
+    ? (...a) => console.log(TAG, `t=${Date.now() % 100000}`, ...a)
+    : () => {};
 const ZOOM_OUT_DURATION = 250;
 const ZOOM_IN_DURATION = 250;
 const BACKDROP_OPACITY = 180;
 const FIT_ALL = 1;
 const FIT_SINGLE = 0;
 const MIN_WS_SCALE = 0.18;
-
-function uiGroupChildCount() {
-    try {
-        const ug = Main.uiGroup;
-        if (!ug) return -1;
-        const kids = ug.get_children?.();
-        if (Array.isArray(kids)) return kids.length;
-        if (typeof ug.get_n_children === 'function') return ug.get_n_children();
-        return -1;
-    } catch {
-        return -1;
-    }
-}
-
-function dropInUiGroup(actor) {
-    if (!actor) return false;
-    try {
-        return actor.get_parent?.() === Main.uiGroup;
-    } catch {
-        return false;
-    }
-}
 
 // Replicates _getRealActorScale from dnd.js (not exported upstream).
 // Walks up the actor tree multiplying scale_x - needed to compute
@@ -225,6 +206,7 @@ export default class SpatialOverviewExtension extends Extension {
         this._dragEndId = null;
         this._dragCancelledId = null;
         this._progressSignalId = null;
+        this._restoreIdleId = 0;
 
         this._patchDraggableCaptureOrigin();
         this._patchFitAllLayout();
@@ -304,8 +286,16 @@ export default class SpatialOverviewExtension extends Extension {
                 if (mw) {
                     const [px, py] = parent.get_transformed_position();
                     const ps = _getRealActorScale(parent);
-                    if (Number.isFinite(px) && Number.isFinite(py))
+                    if (Number.isFinite(px) && Number.isFinite(py)) {
                         ext._fitSingleByMetaWindow.set(mw, {px, py, scale: ps});
+                        // Not every recognized gesture reaches our drag
+                        // monitor, so the entry can't be dropped where it's
+                        // read.
+                        const id = this.connect('drag-end', () => {
+                            ext._fitSingleByMetaWindow?.delete(mw);
+                            this.disconnect(id);
+                        });
+                    }
                 }
             }
             return result;
@@ -511,6 +501,7 @@ export default class SpatialOverviewExtension extends Extension {
             this._dragCancelledId = null;
         }
 
+        this._removeRestoreIdle();
         this._restoreWorkspacesState();
         this._restoreDraggableCaptureOrigin();
         this._restoreFitAllLayout();
@@ -580,8 +571,6 @@ export default class SpatialOverviewExtension extends Extension {
                     logTime('dragMotion', {
                         n: this._dragMotionCount,
                         x: dragEvent.x, y: dragEvent.y,
-                        dropActorInUiGroup: dropInUiGroup(dragEvent.dropActor),
-                        uiGroupChildren: uiGroupChildCount(),
                     });
                 return DND.DragMotionResult.CONTINUE;
             },
@@ -821,10 +810,13 @@ export default class SpatialOverviewExtension extends Extension {
                 duration: ZOOM_IN_DURATION,
                 mode: Clutter.AnimationMode.EASE_OUT_QUAD,
                 onStopped: () => {
-                    GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
-                        this._restoreWorkspacesState();
-                        return GLib.SOURCE_REMOVE;
-                    });
+                    this._removeRestoreIdle();
+                    this._restoreIdleId = GLib.idle_add(
+                        GLib.PRIORITY_DEFAULT, () => {
+                            this._restoreIdleId = 0;
+                            this._restoreWorkspacesState();
+                            return GLib.SOURCE_REMOVE;
+                        });
                 },
             });
         } else {
@@ -841,31 +833,13 @@ export default class SpatialOverviewExtension extends Extension {
 
         if (this._zoomOutView)
             this._zoomOutView.hide();
+    }
 
-        GLib.timeout_add(GLib.PRIORITY_DEFAULT, 800, () => {
-            logTime('POST-DRAG +800ms', {
-                uiGroupChildren: uiGroupChildCount(),
-                overviewVisible: Main.overview?.visible,
-                overviewInWindowDrag: Main.overview?._inWindowDrag,
-                grabCount: Main.layoutManager._grabHelper?._grabStack?.length ?? 'n/a',
-            });
-            this._zoomOutView?.add_style_class_name?.('post-probe-800');
-            return GLib.SOURCE_REMOVE;
-        });
-
-        GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1500, () => {
-            const controls = this._getControls?.();
-            const wsDisplay = controls?._workspacesDisplay;
-            const thumbsBox = controls?._thumbnailsBox;
-            logTime('POST-DRAG +1500ms', {
-                fitMode: wsDisplay?._fitModeAdjustment?.value,
-                thumbsBoxVisible: thumbsBox?.visible,
-                thumbsBoxShouldShow: thumbsBox?._shouldShow,
-                thumbCount: thumbsBox?._thumbnails?.length ?? 0,
-                thumbVisible: thumbsBox?._thumbnails?.map?.(t => ({ visible: t.visible, state: t.state, metaIndex: t.metaWorkspace?.index?.() })),
-            });
-            return GLib.SOURCE_REMOVE;
-        });
+    _removeRestoreIdle() {
+        if (this._restoreIdleId) {
+            GLib.source_remove(this._restoreIdleId);
+            this._restoreIdleId = 0;
+        }
     }
 
     // FIXME downstream: the upstream "new-workspace indicator via drop" lives
