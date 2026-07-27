@@ -15,9 +15,14 @@ const DEBUG = GLib.getenv('SPATIAL_WS_DEBUG') !== null;
 const logTime = DEBUG
     ? (...a) => console.log(TAG, `t=${Date.now() % 100000}`, ...a)
     : () => {};
-const ZOOM_OUT_DURATION = 400;
-const ZOOM_IN_DURATION = 400;
-const ZOOM_OUT_HOLD_DELAY = 300;
+
+const EASING_MAP = {
+    'ease-out-quad': Clutter.AnimationMode.EASE_OUT_QUAD,
+    'ease-out-cubic': Clutter.AnimationMode.EASE_OUT_CUBIC,
+    'ease-out-expo': Clutter.AnimationMode.EASE_OUT_EXPO,
+    'ease-out-back': Clutter.AnimationMode.EASE_OUT_BACK,
+};
+
 const BACKDROP_OPACITY = 180;
 const MIN_WS_SCALE = 0.18;
 const WORKSPACE_CUT_SIZE = 10; // workspaceThumbnail.js:27
@@ -107,16 +112,16 @@ const ZoomOutView = GObject.registerClass({
         logTime('VIEW.show start (zoom-out)');
         this.visible = true;
         this._progressAdj.ease(1, {
-            duration: ZOOM_OUT_DURATION,
-            mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+            duration: this._extension._readDuration('zoom-out-duration'),
+            mode: this._extension._readEasing(),
         });
     }
 
     hide() {
         logTime('VIEW.hide start (zoom-in)');
         this._progressAdj.ease(0, {
-            duration: ZOOM_IN_DURATION,
-            mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+            duration: this._extension._readDuration('zoom-in-duration'),
+            mode: this._extension._readEasing(),
             onComplete: () => {
                 logTime('VIEW.hide onComplete (zoom-in DONE)');
                 this._backdrop.opacity = 0;
@@ -266,6 +271,14 @@ export default class SpatialOverviewExtension extends Extension {
                 logTime('SIGNAL window-drag-cancelled from overview');
                 this._onDragEnd(true);
             });
+    }
+
+    _readDuration(key) {
+        return this.getSettings().get_uint(key);
+    }
+    _readEasing() {
+        const s = this.getSettings().get_string('zoom-easing');
+        return EASING_MAP[s] ?? Clutter.AnimationMode.EASE_OUT_QUAD;
     }
 
     // FIXME downstream: _getRestoreLocation (dnd.js:453) reads the drag origin
@@ -609,16 +622,16 @@ export default class SpatialOverviewExtension extends Extension {
                     this._origAnimateDragEnd = draggable._animateDragEnd;
                     draggable._animateDragEnd = function (eventTime, params) {
                         // _spatialEngaged is already false when the drop landed
-                        // inside ZOOM_OUT_HOLD_DELAY: _onDragEnd cleared it and
+                        // inside the hold delay: _onDragEnd cleared it and
                         // there is no zoom-in to wait for. The duration test
                         // leaves the restoreOnSuccess path alone - it reaches
                         // here too, on REVERT_ANIMATION_TIME (dnd.js:489).
                         if (self._spatialEngaged &&
                             params.duration === DND.SNAP_BACK_ANIMATION_TIME) {
                             logTime('snap-back retimed', {
-                                duration: ZOOM_IN_DURATION,
+                                duration: self._readDuration('zoom-in-duration'),
                             });
-                            params = {...params, duration: ZOOM_IN_DURATION};
+                            params = {...params, duration: self._readDuration('zoom-in-duration')};
                         }
                         return self._origAnimateDragEnd.call(
                             this, eventTime, params);
@@ -658,7 +671,7 @@ export default class SpatialOverviewExtension extends Extension {
         // the drop falls through to upstream.
         this._removeEngageTimeout();
         this._engageTimeoutId = GLib.timeout_add(
-            GLib.PRIORITY_DEFAULT, ZOOM_OUT_HOLD_DELAY, () => {
+            GLib.PRIORITY_DEFAULT, this._readDuration('zoom-out-hold-delay'), () => {
                 this._engageTimeoutId = 0;
                 this._engageSpatialLayout();
                 return GLib.SOURCE_REMOVE;
@@ -699,8 +712,8 @@ export default class SpatialOverviewExtension extends Extension {
                     'notify::value', () => this._revalidateDragHover());
 
                 ws._fitModeAdjustment.ease(FitMode.ALL, {
-                    duration: ZOOM_OUT_DURATION,
-                    mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                    duration: this._readDuration('zoom-out-duration'),
+                    mode: this._readEasing(),
                 });
             }
 
@@ -989,8 +1002,8 @@ export default class SpatialOverviewExtension extends Extension {
             logTime('_onDragEnd: starting zoom-in ease to FitMode.SINGLE', {isCancel});
             ws._fitModeAdjustment.remove_transition('value');
             ws._fitModeAdjustment.ease(FitMode.SINGLE, {
-                duration: ZOOM_IN_DURATION,
-                mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                duration: this._readDuration('zoom-in-duration'),
+                mode: this._readEasing(),
                 onStopped: () => {
                     // Not earlier: the ease allocates on every frame, and each
                     // allocation asks _spatialLayoutActive.

@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <enum id="org.gnome.shell.extensions.spatial-overview.AnimationEasing">
+    <value nick="ease-out-quad" value="0" />
+    <value nick="ease-out-cubic" value="1" />
+    <value nick="ease-out-expo" value="2" />
+    <value nick="ease-out-back" value="3" />
+  </enum>
+
+  <schema path="/org/gnome/shell/extensions/spatial-overview/"
+          id="org.gnome.shell.extensions.spatial-overview">
+    <key name="zoom-out-duration" type="u">
+      <default>400</default>
+      <range min="0" max="2000" />
+      <summary>Zoom-out animation duration</summary>
+      <description>Duration in milliseconds for the zoom-out animation that expands workspaces when a drag begins and the window has been held long enough.</description>
+    </key>
+    <key name="zoom-in-duration" type="u">
+      <default>400</default>
+      <range min="0" max="2000" />
+      <summary>Zoom-in animation duration</summary>
+      <description>Duration in milliseconds for the zoom-in animation that restores the workspace layout when a drag ends.</description>
+    </key>
+    <key name="zoom-out-hold-delay" type="u">
+      <default>300</default>
+      <range min="0" max="5000" />
+      <summary>Hold delay before engaging spatial layout</summary>
+      <description>Milliseconds the window must be held before the spatial zoom-out engages. 0 disables the hold: every drag (even a click) engages immediately, and the upstream drop fall-through path described in commit 54bee12 no longer applies.</description>
+    </key>
+    <key name="zoom-easing" enum="org.gnome.shell.extensions.spatial-overview.AnimationEasing">
+      <default>'ease-out-quad'</default>
+      <summary>Easing mode for zoom animations</summary>
+      <description>Clutter.AnimationMode applied to both zoom-in and zoom-out. Options: EASE_OUT_QUAD (default), EASE_OUT_CUBIC, EASE_OUT_EXPO, EASE_OUT_BACK.</description>
+    </key>
+  </schema>
+</schemalist>
