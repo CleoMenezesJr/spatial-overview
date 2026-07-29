@@ -236,7 +236,10 @@ export default class SpatialOverviewExtension extends Extension {
         this._spatialEngaged = false;
         this._dropInsertIndex = -1;
         this._dropWorkspaceIndex = -1;
+        this._sessionModeUpdatedId = 0;
+        this._panelPatched = false;
 
+        this._patchPanelLayout();
         this._patchDraggableCaptureOrigin();
         this._patchFitAllLayout();
 
@@ -536,6 +539,7 @@ export default class SpatialOverviewExtension extends Extension {
         this._restoreWorkspacesState();
         this._restoreDraggableCaptureOrigin();
         this._restoreFitAllLayout();
+        this._restorePanelLayout();
         this._dragActive = false;
 
         if (this._zoomOutView) {
@@ -1341,6 +1345,132 @@ export default class SpatialOverviewExtension extends Extension {
                 }
             }
         }
+    }
+
+    // FIXME downstream: panel item positions are hardcoded in sessionMode.js
+    // ('user' mode: `left: ['activities'], center: ['dateMenu']`,
+    // sessionMode.js:97-99). There is no GSettings key, no dconf knob, no
+    // extension API to swap them, so this reparents the indicators' containers
+    // between Panel._leftBox and Panel._centerBox (panel.js:446-451), neither
+    // of which is exported on the Panel class.
+    //
+    // sessionMode.connect('updated') re-runs Panel._updatePanel on every mode
+    // change (lock screen, initial setup, logout), which re-inserts each
+    // container into the box sessionMode declares for it. _reapplyPanelLayout
+    // re-moves them after the dust settles.
+    //
+    // Ideal upstream fix: make panel.left/center/right configurable via
+    // GSettings, with sessionMode.js reading the position for each role
+    // rather than hardcoding it.
+    _patchPanelLayout() {
+        if (this._panelPatched)
+            return;
+
+        const panel = Main.panel;
+        if (!panel?._leftBox || !panel?._centerBox)
+            return;
+
+        const dateMenu = panel.statusArea.dateMenu;
+        const activities = panel.statusArea.activities;
+
+        // ActivitiesButton has no menu (panel.js:201, dontCreateMenu=true) and
+        // DateMenuButton aligns at 0.5 (dateMenu.js:863). Each box holds one
+        // child, so the swap is visually neutral.
+        if (dateMenu?.container) {
+            const parent = dateMenu.container.get_parent();
+            if (parent)
+                parent.remove_child(dateMenu.container);
+            panel._leftBox.insert_child_at_index(dateMenu.container, 0);
+        }
+
+        if (activities?.container) {
+            const parent = activities.container.get_parent();
+            if (parent)
+                parent.remove_child(activities.container);
+            panel._centerBox.insert_child_at_index(activities.container, 0);
+        }
+
+        // Upstream _updatePanel sets this from
+        // `panel.left.includes('dateMenu')` (panel.js:641-647). Follow the
+        // same rule so notification banners line up under the new clock side.
+        if (dateMenu?.container) {
+            this._origBannerAlignment = Main.messageTray.bannerAlignment;
+            Main.messageTray.bannerAlignment = Clutter.ActorAlign.START;
+        }
+
+        this._sessionModeUpdatedId = Main.sessionMode.connect(
+            'updated', () => this._reapplyPanelLayout());
+
+        this._panelPatched = true;
+        logTime('_patchPanelLayout: clock -> left, activities -> center');
+    }
+
+    _reapplyPanelLayout() {
+        const panel = Main.panel;
+        if (!panel?._leftBox || !panel?._centerBox)
+            return;
+
+        const dateMenu = panel.statusArea.dateMenu;
+        const activities = panel.statusArea.activities;
+
+        if (dateMenu?.container) {
+            const leftBox = panel._leftBox;
+            const parent = dateMenu.container.get_parent();
+            if (parent && parent !== leftBox) {
+                parent.remove_child(dateMenu.container);
+                leftBox.insert_child_at_index(dateMenu.container, 0);
+            }
+        }
+
+        if (activities?.container) {
+            const centerBox = panel._centerBox;
+            const parent = activities.container.get_parent();
+            if (parent && parent !== centerBox) {
+                parent.remove_child(activities.container);
+                centerBox.insert_child_at_index(activities.container, 0);
+            }
+        }
+
+        if (dateMenu?.container)
+            Main.messageTray.bannerAlignment = Clutter.ActorAlign.START;
+    }
+
+    _restorePanelLayout() {
+        if (!this._panelPatched)
+            return;
+
+        if (this._sessionModeUpdatedId) {
+            Main.sessionMode.disconnect(this._sessionModeUpdatedId);
+            this._sessionModeUpdatedId = 0;
+        }
+
+        const panel = Main.panel;
+        const dateMenu = panel?.statusArea.dateMenu;
+        const activities = panel?.statusArea.activities;
+
+        if (dateMenu?.container) {
+            const parent = dateMenu.container.get_parent();
+            if (parent)
+                parent.remove_child(dateMenu.container);
+            panel?._centerBox?.insert_child_at_index(dateMenu.container, 0);
+        }
+
+        if (activities?.container) {
+            const parent = activities.container.get_parent();
+            if (parent)
+                parent.remove_child(activities.container);
+            panel?._leftBox?.insert_child_at_index(activities.container, 0);
+        }
+
+        if (this._origBannerAlignment !== undefined) {
+            Main.messageTray.bannerAlignment = this._origBannerAlignment;
+            this._origBannerAlignment = undefined;
+        } else {
+            Main.messageTray.bannerAlignment = Clutter.ActorAlign.CENTER;
+        }
+
+        this._panelPatched = false;
+        logTime('_restorePanelLayout: clock -> center, activities -> left');
     }
 
     _getControls() {
