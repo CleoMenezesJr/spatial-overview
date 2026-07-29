@@ -15,9 +15,9 @@ const DEBUG = GLib.getenv('SPATIAL_WS_DEBUG') !== null;
 const logTime = DEBUG
     ? (...a) => console.log(TAG, `t=${Date.now() % 100000}`, ...a)
     : () => {};
-const ZOOM_OUT_DURATION = 400;
+const ZOOM_OUT_DURATION = 210;
 const ZOOM_IN_DURATION = 400;
-const ZOOM_OUT_HOLD_DELAY = 300;
+const ZOOM_OUT_HOLD_DELAY = 150;
 const BACKDROP_OPACITY = 180;
 const MIN_WS_SCALE = 0.18;
 const WORKSPACE_CUT_SIZE = 10; // workspaceThumbnail.js:27
@@ -108,7 +108,7 @@ const ZoomOutView = GObject.registerClass({
         this.visible = true;
         this._progressAdj.ease(1, {
             duration: ZOOM_OUT_DURATION,
-            mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+            mode: Clutter.AnimationMode.EASE_OUT_CUBIC,
         });
     }
 
@@ -116,7 +116,7 @@ const ZoomOutView = GObject.registerClass({
         logTime('VIEW.hide start (zoom-in)');
         this._progressAdj.ease(0, {
             duration: ZOOM_IN_DURATION,
-            mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+            mode: Clutter.AnimationMode.EASE_OUT_CUBIC,
             onComplete: () => {
                 logTime('VIEW.hide onComplete (zoom-in DONE)');
                 this._backdrop.opacity = 0;
@@ -601,7 +601,7 @@ export default class SpatialOverviewExtension extends Extension {
                     // zoom-in has reached instead of the endpoint it was eased
                     // to.
                     //
-                    // Both eases use EASE_OUT_QUAD and are created in the same
+                    // Both eases use EASE_OUT_CUBIC and are created in the same
                     // frame, so equal durations put the handoff on the value the
                     // ease already reached. Ideal upstream fix: let the drag
                     // origin own the snap-back - endpoint and clock - which is
@@ -700,7 +700,7 @@ export default class SpatialOverviewExtension extends Extension {
 
                 ws._fitModeAdjustment.ease(FitMode.ALL, {
                     duration: ZOOM_OUT_DURATION,
-                    mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                    mode: Clutter.AnimationMode.EASE_OUT_CUBIC,
                 });
             }
 
@@ -990,7 +990,7 @@ export default class SpatialOverviewExtension extends Extension {
             ws._fitModeAdjustment.remove_transition('value');
             ws._fitModeAdjustment.ease(FitMode.SINGLE, {
                 duration: ZOOM_IN_DURATION,
-                mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                mode: Clutter.AnimationMode.EASE_OUT_CUBIC,
                 onStopped: () => {
                     // Not earlier: the ease allocates on every frame, and each
                     // allocation asks _spatialLayoutActive.
