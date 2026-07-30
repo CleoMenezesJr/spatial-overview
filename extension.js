@@ -1,6 +1,3 @@
-// this code is messy and experimental - just testing things out
-// dont treat this as production-ready, it's only here to help visualize the result
-
 import GObject from 'gi://GObject';
 import Clutter from 'gi://Clutter';
 import GLib from 'gi://GLib';
@@ -251,7 +248,6 @@ export default class SpatialOverviewExtension extends Extension {
         Main.layoutManager.overviewGroup.add_child(this._zoomOutView);
 
         this._overrideThumbnailsShouldShow();
-        this._overrideWorkspaceDotExpansion();
 
         this._progressSignalId = this._zoomOutView._progressAdj.connect(
             'notify::value', () => {
@@ -545,8 +541,6 @@ export default class SpatialOverviewExtension extends Extension {
         this._restoreFitAllLayout();
         this._restorePanelLayout();
         this._dragActive = false;
-
-        this._restoreWorkspaceDotExpansion();
 
         if (this._zoomOutView) {
             this._zoomOutView.destroy();
@@ -1319,68 +1313,6 @@ export default class SpatialOverviewExtension extends Extension {
 
     _getThumbnailsBox() {
         return Main.overview?._overview?.controls?._thumbnailsBox ?? null;
-    }
-
-    // FIXME downstream: upstream widthMultiplier (panel.js:182-188) decresce
-    // com nWorkspaces — o dot expandido encolhe conforme mais workspaces
-    // existem. No canto esquerdo isso não era problemático (Fitts), mas com
-    // os dots no centro (_patchPanelLayout moves activities para _centerBox)
-    // o alvo fica menos acessível. Esta overlay inverte a curva para n≤4:
-    //   n=1-2: 7.25×  (= 2× o máximo upstream, ~65 px)
-    //   n=3:   4.5×
-    //   n=4:   3.5×
-    //   n≥5:   upstream (3.25×, 2.75×)
-    _overrideWorkspaceDotExpansion() {
-        const indicators = Main.panel.statusArea.activities
-            ?.get_first_child();
-        if (!indicators || !indicators._updateExpansion)
-            return;
-
-        indicators.x_align = Clutter.ActorAlign.CENTER;
-
-        this._origUpdateExpansion = indicators._updateExpansion;
-
-        indicators._updateExpansion = function () {
-            const nIndicators =
-                this._getActiveIndicators().length;
-            const activeWorkspace =
-                this._workspacesAdjustment.value;
-
-            let widthMultiplier;
-            if (nIndicators <= 2)
-                widthMultiplier = 7.25;
-            else if (nIndicators === 3)
-                widthMultiplier = 4.5;
-            else if (nIndicators === 4)
-                widthMultiplier = 3.5;
-            else if (nIndicators <= 5)
-                widthMultiplier = 3.25;
-            else
-                widthMultiplier = 2.75;
-
-            this.get_children().forEach((indicator, index) => {
-                const distance = Math.abs(
-                    index - activeWorkspace);
-                indicator.expansion =
-                    Math.clamp(1 - distance, 0, 1);
-                indicator.widthMultiplier = widthMultiplier;
-            });
-
-            Main.panel.queue_relayout();
-        };
-
-        indicators._updateExpansion();
-    }
-
-    _restoreWorkspaceDotExpansion() {
-        const indicators = Main.panel.statusArea.activities
-            ?.get_first_child();
-        if (indicators && this._origUpdateExpansion) {
-            indicators._updateExpansion =
-                this._origUpdateExpansion;
-            indicators._updateExpansion();
-        }
-        this._origUpdateExpansion = null;
     }
 
     _restoreWorkspacesState() {
