@@ -21,6 +21,7 @@ const ZOOM_OUT_HOLD_DELAY = 150;
 const BACKDROP_OPACITY = 180;
 const MIN_WS_SCALE = 0.18;
 const WORKSPACE_CUT_SIZE = 10; // workspaceThumbnail.js:27
+const MIN_WORKSPACES = 3;
 const PLACEHOLDER_WIDTH = 24;
 
 // Replicates _getRealActorScale from dnd.js (not exported upstream).
@@ -237,6 +238,7 @@ export default class SpatialOverviewExtension extends Extension {
         this._dropInsertIndex = -1;
         this._dropWorkspaceIndex = -1;
         this._sessionModeUpdatedId = 0;
+        this._minWorkspacesId = 0;
         this._panelPatched = false;
 
         this._patchPanelLayout();
@@ -248,6 +250,13 @@ export default class SpatialOverviewExtension extends Extension {
         Main.layoutManager.overviewGroup.add_child(this._zoomOutView);
 
         this._overrideThumbnailsShouldShow();
+
+        if (Meta.prefs_get_dynamic_workspaces()) {
+            this._minWorkspacesId = global.workspace_manager.connect(
+                'workspace-removed',
+                () => this._ensureMinWorkspaces(MIN_WORKSPACES));
+            this._ensureMinWorkspaces(MIN_WORKSPACES);
+        }
 
         this._progressSignalId = this._zoomOutView._progressAdj.connect(
             'notify::value', () => {
@@ -503,6 +512,11 @@ export default class SpatialOverviewExtension extends Extension {
     }
 
     disable() {
+        if (this._minWorkspacesId) {
+            global.workspace_manager.disconnect(this._minWorkspacesId);
+            this._minWorkspacesId = 0;
+        }
+
         if (this._dragActive)
             this._onDragEnd();
 
@@ -1313,6 +1327,17 @@ export default class SpatialOverviewExtension extends Extension {
 
     _getThumbnailsBox() {
         return Main.overview?._overview?.controls?._thumbnailsBox ?? null;
+    }
+
+    // FIXME downstream: upstream keeps min(nWorkspaces)=2 with dynamic
+    // workspaces (1 occupied + 1 empty). This patch raises the floor to
+    // MIN_WORKSPACES. Upstream fix: make the min configurable in mutter's
+    // MetaWorkspaceManager or expose a setting in gnome-shell.
+    _ensureMinWorkspaces(min) {
+        const mgr = global.workspace_manager;
+        while (mgr.n_workspaces < min)
+            Main.wm.insertWorkspace(mgr.n_workspaces);
+        logTime('_ensureMinWorkspaces', {n: mgr.n_workspaces});
     }
 
     _restoreWorkspacesState() {
