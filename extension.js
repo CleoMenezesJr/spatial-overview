@@ -1493,8 +1493,33 @@ export default class SpatialOverviewExtension extends Extension {
         };
 
         this._minWorkspacesProto = proto;
-        tracker._queueCheckWorkspaces();
+        this._rebindWorkspaceCheck(tracker);
         logTime('_patchMinWorkspaces', {min: MIN_WORKSPACES});
+    }
+
+    // FIXME downstream: _queueCheckWorkspaces binds the method at queue time
+    // (`laters.add(BEFORE_REDRAW, this._checkWorkspaces.bind(this))`,
+    // windowManager.js:337) and will not queue a second one while
+    // _checkWorkspacesId is set. A check already in flight when we swap the
+    // method therefore still runs the old one, and clears the id on its way
+    // out, so nothing re-queues until the next window or workspace event.
+    //
+    // That only matters to a replacement, and it mattered to this one: the
+    // floor first took effect on whatever event came next, so the third
+    // workspace appeared only once the first had been used.
+    //
+    // Ideal upstream fix: bind once in the constructor, so replacing the
+    // method is not a race.
+    _rebindWorkspaceCheck(tracker) {
+        if (!tracker)
+            return;
+
+        if (tracker._checkWorkspacesId !== 0) {
+            global.compositor.get_laters().remove(tracker._checkWorkspacesId);
+            tracker._checkWorkspacesId = 0;
+            logTime('_rebindWorkspaceCheck: dropped a pending check');
+        }
+        tracker._queueCheckWorkspaces();
     }
 
     _restoreMinWorkspaces() {
@@ -1505,7 +1530,7 @@ export default class SpatialOverviewExtension extends Extension {
         proto._checkWorkspaces = proto._spatialOrigCheckWorkspaces;
         delete proto._spatialOrigCheckWorkspaces;
         this._minWorkspacesProto = null;
-        Main.wm._workspaceTracker?._queueCheckWorkspaces();
+        this._rebindWorkspaceCheck(Main.wm._workspaceTracker);
         logTime('_restoreMinWorkspaces');
     }
 
