@@ -6,6 +6,7 @@ import GObject from 'gi://GObject';
 import Clutter from 'gi://Clutter';
 import GLib from 'gi://GLib';
 import Meta from 'gi://Meta';
+import Shell from 'gi://Shell';
 import St from 'gi://St';
 
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
@@ -1340,52 +1341,160 @@ export default class SpatialOverviewExtension extends Extension {
     // MIN_NUM_WORKSPACES = 2 in windowManager.js:42 and read only inside
     // WorkspaceTracker._checkWorkspaces (windowManager.js:273,286). That
     // method is the single authority: it runs on a BEFORE_REDRAW later after
-    // any workspace change and deletes empty workspaces down to its own floor.
+    // any workspace change and is what adds and deletes workspaces.
     //
-    // Topping the count up from outside cannot work, and the previous revision
-    // of this patch showed why: appending fires notify::n-workspaces, which
-    // queues _checkWorkspaces, which deletes what we just added, which emits
-    // workspace-removed, which made us append again. The nested-shell log has
-    // that add/remove ping-pong on every startup, and the count settled
-    // wherever the loop happened to stall (3 occupied + 2 empty was one).
+    // Bumping that number does not raise the floor, because the deletion loop
+    // only holds it with a break, walking backwards:
     //
-    // So veto the deletion instead of racing it. _checkWorkspaces reaches
-    // removal through `workspaceManager.remove_workspace(...)`, an ordinary
-    // JS property lookup, so shadowing it on the prototype makes upstream stop
-    // exactly where a higher MIN_NUM_WORKSPACES would have stopped it - its
-    // own loop guard is `n_workspaces === MIN_NUM_WORKSPACES`. Every other
-    // rule stays upstream's, including "keep one empty workspace at the end",
-    // so above the floor the count still tracks usage instead of pinning two
-    // spare workspaces.
+    //     for (i = lastIndex; i >= 0; i--) {
+    //         if (workspaceManager.n_workspaces === MIN_NUM_WORKSPACES)
+    //             break;
+    //         if (emptyWorkspaces[i] && i !== lastEmptyIndex)
+    //             workspaceManager.remove_workspace(...);
+    //     }
     //
-    // Ideal upstream fix: make MIN_NUM_WORKSPACES configurable (GSettings key
-    // read by _checkWorkspaces). Then both the veto and the top-up below go.
+    // Coming from the end, the break fires while still inside the trailing
+    // run of empty workspaces and never reaches an empty one in front of an
+    // occupied one. At 2 that is unreachable; at 3, [empty, occupied, empty]
+    // keeps its first workspace forever.
+    //
+    // So state the rule instead of guarding it: keep the occupied workspaces,
+    // the active one, and the trailing empty run - grown until it meets the
+    // floor - and remove the rest. The policy stays upstream's, one spare at
+    // the end, so the floor only shows up when the count would fall short:
+    //
+    //     occupied   0   1   2   3   4
+    //     upstream   2   2   3   4   5
+    //     here       3   3   3   4   5
+    //
+    // At MIN 2 it reproduces upstream exactly, which is what makes it a
+    // generalisation rather than a different rule.
+    //
+    // Ideal upstream fix: this loop, with MIN_NUM_WORKSPACES from GSettings.
     _patchMinWorkspaces() {
         if (!Meta.prefs_get_dynamic_workspaces())
             return;
 
-        const mgr = global.workspace_manager;
-        const proto = mgr.constructor.prototype;
+        const tracker = Main.wm._workspaceTracker;
+        const proto = tracker?.constructor.prototype;
+        if (!proto || proto._spatialOrigCheckWorkspaces)
+            return;
 
-        if (!proto._spatialOrigRemoveWorkspace) {
-            proto._spatialOrigRemoveWorkspace = proto.remove_workspace;
-            proto.remove_workspace = function (workspace, time) {
-                if (this.n_workspaces <= MIN_WORKSPACES) {
-                    logTime('remove_workspace vetoed at floor',
-                        {n: this.n_workspaces});
-                    return;
+        let lastLine = '';
+
+        proto._spatialOrigCheckWorkspaces = proto._checkWorkspaces;
+        proto._checkWorkspaces = function () {
+            const workspaceManager = global.workspace_manager;
+            const time = global.get_current_time();
+            let i;
+
+            if (!Meta.prefs_get_dynamic_workspaces()) {
+                this._checkWorkspacesId = 0;
+                return GLib.SOURCE_REMOVE;
+            }
+
+            if (this._pauseWorkspaceCheck)
+                return GLib.SOURCE_CONTINUE;
+
+            // Verbatim from upstream (windowManager.js:235-264).
+            const emptyWorkspaces = [];
+            for (i = 0; i < this._workspaces.length; i++) {
+                const lastRemoved = this._workspaces[i]._lastRemovedWindow;
+                if ((lastRemoved &&
+                     (lastRemoved.get_window_type() === Meta.WindowType.SPLASHSCREEN ||
+                      lastRemoved.get_window_type() === Meta.WindowType.DIALOG ||
+                      lastRemoved.get_window_type() === Meta.WindowType.MODAL_DIALOG)) ||
+                    this._workspaces[i]._keepAliveId)
+                    emptyWorkspaces[i] = false;
+                else
+                    emptyWorkspaces[i] = true;
+            }
+
+            const sequences = Shell.WindowTracker.get_default().get_startup_sequences();
+            for (i = 0; i < sequences.length; i++) {
+                const index = sequences[i].get_workspace();
+                if (index >= 0 && index <= workspaceManager.n_workspaces)
+                    emptyWorkspaces[index] = false;
+            }
+
+            const windows = global.get_window_actors();
+            for (i = 0; i < windows.length; i++) {
+                const actor = windows[i];
+                const win = actor.get_meta_window();
+
+                if (win.is_on_all_workspaces())
+                    continue;
+
+                const workspaceIndex = win.get_workspace().index();
+                emptyWorkspaces[workspaceIndex] = false;
+            }
+
+            // Index the trailing empty run starts at. Read before the active
+            // workspace is protected, as upstream does, so that being parked
+            // on an empty workspace does not move it.
+            const lastEmptyIndex = emptyWorkspaces.lastIndexOf(false) + 1;
+            const activeIndex = workspaceManager.get_active_workspace_index();
+
+            // X occupied, . empty, (parentheses) active. Read here because the
+            // next line overwrites the active workspace's own reading.
+            const before = DEBUG
+                ? emptyWorkspaces
+                    .map((empty, index) => {
+                        const cell = empty ? '.' : 'X';
+                        return index === activeIndex ? `(${cell})` : ` ${cell} `;
+                    })
+                    .join('')
+                : '';
+
+            emptyWorkspaces[activeIndex] = false;
+
+            const keep = emptyWorkspaces.map(empty => !empty);
+            let kept = keep.reduce((n, k) => n + (k ? 1 : 0), 0);
+
+            // Grow the trailing run: one empty workspace at the end, plus
+            // whatever the floor is still short of. The active workspace can
+            // sit inside that run, so already-kept indices are skipped rather
+            // than counted twice.
+            for (i = lastEmptyIndex; kept < MIN_WORKSPACES || i === lastEmptyIndex; i++) {
+                if (i === keep.length) {
+                    workspaceManager.append_new_workspace(false, time);
+                    keep.push(false);
                 }
-                proto._spatialOrigRemoveWorkspace.call(this, workspace, time);
-            };
-            this._minWorkspacesProto = proto;
-        }
+                if (!keep[i]) {
+                    keep[i] = true;
+                    kept++;
+                }
+            }
 
-        // Only needed to reach the floor the first time; with the veto in
-        // place nothing drops us back below it, so this does not re-arm.
-        while (mgr.n_workspaces < MIN_WORKSPACES)
-            mgr.append_new_workspace(false, global.get_current_time());
+            const appended = keep.length - emptyWorkspaces.length;
+            const removed = [];
 
-        logTime('_patchMinWorkspaces', {n: mgr.n_workspaces});
+            // From the end, so the indices still to visit stay valid.
+            for (i = keep.length - 1; i >= 0; i--) {
+                if (!keep[i]) {
+                    removed.unshift(i);
+                    workspaceManager.remove_workspace(this._workspaces[i], time);
+                }
+            }
+
+            // Only when the reading changes - this runs several times a second.
+            if (DEBUG) {
+                const line = `${before} lastEmpty=${lastEmptyIndex}` +
+                    ` +${appended} -[${removed.join(',')}]` +
+                    ` => n=${keep.length - removed.length}`;
+                if (line !== lastLine) {
+                    lastLine = line;
+                    logTime('_checkWorkspaces', line);
+                }
+            }
+
+            this._checkWorkspacesId = 0;
+            return GLib.SOURCE_REMOVE;
+        };
+
+        this._minWorkspacesProto = proto;
+        tracker._queueCheckWorkspaces();
+        logTime('_patchMinWorkspaces', {min: MIN_WORKSPACES});
     }
 
     _restoreMinWorkspaces() {
@@ -1393,9 +1502,10 @@ export default class SpatialOverviewExtension extends Extension {
         if (!proto)
             return;
 
-        proto.remove_workspace = proto._spatialOrigRemoveWorkspace;
-        delete proto._spatialOrigRemoveWorkspace;
+        proto._checkWorkspaces = proto._spatialOrigCheckWorkspaces;
+        delete proto._spatialOrigCheckWorkspaces;
         this._minWorkspacesProto = null;
+        Main.wm._workspaceTracker?._queueCheckWorkspaces();
         logTime('_restoreMinWorkspaces');
     }
 
