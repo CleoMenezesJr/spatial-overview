@@ -13,6 +13,7 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as DND from 'resource:///org/gnome/shell/ui/dnd.js';
 import {FitMode, WorkspacesView} from 'resource:///org/gnome/shell/ui/workspacesView.js';
 import {ControlsState} from 'resource:///org/gnome/shell/ui/overviewControls.js';
+import {HotCorner} from 'resource:///org/gnome/shell/ui/layout.js';
 
 const TAG = '[SPATIAL-WS]';
 const DEBUG = GLib.getenv('SPATIAL_WS_DEBUG') !== null;
@@ -27,6 +28,9 @@ const MIN_WS_SCALE = 0.18;
 const WORKSPACE_CUT_SIZE = 10; // workspaceThumbnail.js:27
 const MIN_WORKSPACES = 3;
 const WORKSPACE_DOT_DURATION = 500; // panel.js:114,125
+// Multiplies the barrier size layout.js passes in (panelBox.height), so the
+// centered hot zone scales with the panel instead of pinning a pixel count.
+const HOT_CORNER_WIDTH_FACTOR = 5;
 const PLACEHOLDER_WIDTH = 24;
 
 // Replicates _getRealActorScale from dnd.js (not exported upstream).
@@ -246,9 +250,11 @@ export default class SpatialOverviewExtension extends Extension {
         this._minWorkspacesProto = null;
         this._panelPatched = false;
         this._workspaceDotProto = null;
+        this._hotCornerPatched = false;
 
         this._patchPanelLayout();
         this._patchWorkspaceDots();
+        this._patchHotCorner();
         this._patchDraggableCaptureOrigin();
         this._patchFitAllLayout();
 
@@ -554,6 +560,7 @@ export default class SpatialOverviewExtension extends Extension {
         this._restoreFitAllLayout();
         this._restorePanelLayout();
         this._restoreWorkspaceDots();
+        this._restoreHotCorner();
         this._dragActive = false;
 
         if (this._zoomOutView) {
@@ -1422,6 +1429,108 @@ export default class SpatialOverviewExtension extends Extension {
                 }
             }
         }
+    }
+
+    // FIXME downstream: the hot corner is hardcoded to the monitor's top-left.
+    // LayoutManager._updateHotCorners builds every HotCorner at
+    // `cornerX = monitor.x` (layout.js:450-451), and HotCorner.setBarrierSize
+    // welds an L of two barriers to that origin, growing +X and +Y
+    // (layout.js:1221-1231). Nothing in between is configurable.
+    //
+    // With Activities moved to the panel's center by _patchPanelLayout, the
+    // corner that opens the overview and the button that opens the overview
+    // sat at opposite ends of the screen. This puts the trigger back under
+    // the button.
+    //
+    // Only the horizontal barrier survives the move. Upstream's vertical leg
+    // presses against the left screen edge; at mid-screen there is no edge
+    // behind it, so it would just be a floating wall that traps the pointer
+    // in the top band. A mid-edge trigger is an edge, not a corner.
+    //
+    // Barrier `directions` name the directions in which crossing is allowed,
+    // so POSITIVE_Y (upstream's own value here) is what makes an upward push
+    // build pressure against the top of the screen.
+    //
+    // The ripple moves with it - origin, pivot and shape. Upstream's wave is
+    // corner-shaped in all three, and none of them survives the move alone.
+    //
+    // Ideal upstream fix: let the hot corner's position be chosen - a
+    // GSettings key, or deriving it from wherever 'activities' sits in
+    // sessionMode - instead of assuming the top-left corner.
+    _patchHotCorner() {
+        const proto = HotCorner.prototype;
+        if (proto._spatialOrigSetBarrierSize)
+            return;
+
+        proto._spatialOrigSetBarrierSize = proto.setBarrierSize;
+        proto.setBarrierSize = function (size) {
+            if (this._verticalBarrier) {
+                this._pressureBarrier.removeBarrier(this._verticalBarrier);
+                this._verticalBarrier.destroy();
+                this._verticalBarrier = null;
+            }
+
+            if (this._horizontalBarrier) {
+                this._pressureBarrier.removeBarrier(this._horizontalBarrier);
+                this._horizontalBarrier.destroy();
+                this._horizontalBarrier = null;
+            }
+
+            if (size <= 0)
+                return;
+
+            const width = size * HOT_CORNER_WIDTH_FACTOR;
+            const centerX = Math.round(this._monitor.x + this._monitor.width / 2);
+            const x = centerX - Math.round(width / 2);
+
+            // _toggleOverview plays the ripple at this._x (layout.js:1253),
+            // so move it too or the feedback stays in the old corner.
+            this._x = centerX;
+
+            // Ripples places the wave by pivot point plus a matching
+            // translation (ripples.js:22-36,63). HotCorner pivots at (0, 0)
+            // so a quarter disc blooms away from the screen corner; centered
+            // on the top edge that same pivot drags the wave in from the
+            // upper left. (0.5, 0) anchors it to the edge and centers it, and
+            // .spatial-hot-edge-ripple swaps the quarter disc for a half one
+            // so the shape matches the anchor.
+            const ripples = this._ripples;
+            if (ripples && ripples._px !== 0.5) {
+                ripples._px = 0.5;
+                ripples._py = 0.0;
+                for (const r of
+                    [ripples._ripple1, ripples._ripple2, ripples._ripple3]) {
+                    r?.set_pivot_point(0.5, 0.0);
+                    r?.add_style_class_name('spatial-hot-edge-ripple');
+                }
+            }
+
+            this._horizontalBarrier = new Meta.Barrier({
+                backend: global.backend,
+                x1: x, x2: x + width,
+                y1: this._monitor.y, y2: this._monitor.y,
+                directions: Meta.BarrierDirection.POSITIVE_Y,
+            });
+            this._pressureBarrier.addBarrier(this._horizontalBarrier);
+            logTime('hot zone', {x, width, centerX, y: this._monitor.y});
+        };
+
+        this._hotCornerPatched = true;
+        Main.layoutManager._updateHotCorners();
+        logTime('_patchHotCorner: hot corner -> top center');
+    }
+
+    _restoreHotCorner() {
+        if (!this._hotCornerPatched)
+            return;
+
+        const proto = HotCorner.prototype;
+        proto.setBarrierSize = proto._spatialOrigSetBarrierSize;
+        delete proto._spatialOrigSetBarrierSize;
+
+        this._hotCornerPatched = false;
+        Main.layoutManager._updateHotCorners();
+        logTime('_restoreHotCorner');
     }
 
     _getWorkspaceIndicators() {

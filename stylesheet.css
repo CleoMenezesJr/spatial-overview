@@ -33,3 +33,24 @@
   -natural-hpadding: 0;
   -minimum-hpadding: 0;
 }
+
+/* FIXME downstream: the hot corner ripple is a quarter disc, by construction.
+   gnome-shell-dark.css:2028-2035 gives .ripple-box a 52x52 box with
+   `border-radius: 0 0 52px 0` - one rounded corner - and HotCorner pivots it
+   at (0, 0), so the arc bulges away from the screen corner while the rest
+   falls off-screen. That is right for a corner and wrong for anything else.
+
+   _patchHotCorner moves the trigger to the middle of the top edge, where the
+   shape has no corner to hide in. A top edge wants a half disc: flat along
+   the edge, rounded at both ends, pivoted at (0.5, 0) so it blooms straight
+   down. 104 = 2 x 52 keeps the two bottom radii summing to the full width,
+   which is what makes it a true semicircle rather than a rounded box.
+
+   Ideal upstream fix: derive the ripple's shape and pivot from where the
+   trigger actually is, instead of assuming a corner. */
+.ripple-box.spatial-hot-edge-ripple,
+.ripple-box.spatial-hot-edge-ripple:rtl {
+  width: 104px;
+  height: 52px;
+  border-radius: 0 0 52px 52px;
+}
