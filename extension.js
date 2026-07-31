@@ -1399,13 +1399,16 @@ export default class SpatialOverviewExtension extends Extension {
         const activities = panel.statusArea.activities;
 
         // ActivitiesButton has no menu (panel.js:201, dontCreateMenu=true) and
-        // DateMenuButton aligns at 0.5 (dateMenu.js:863). Each box holds one
-        // child, so the swap is visually neutral.
+        // DateMenuButton aligns at 0.5 (dateMenu.js:863), so neither carries a
+        // position-dependent menu anchor. The geometry is not neutral though:
+        // at the left edge the clock's ButtonBox hpadding becomes a visible
+        // gap, which .spatial-clock-left cancels.
         if (dateMenu?.container) {
             const parent = dateMenu.container.get_parent();
             if (parent)
                 parent.remove_child(dateMenu.container);
             panel._leftBox.insert_child_at_index(dateMenu.container, 0);
+            dateMenu.add_style_class_name('spatial-clock-left');
         }
 
         if (activities?.container) {
@@ -1445,6 +1448,7 @@ export default class SpatialOverviewExtension extends Extension {
                 parent.remove_child(dateMenu.container);
                 leftBox.insert_child_at_index(dateMenu.container, 0);
             }
+            dateMenu.add_style_class_name('spatial-clock-left');
         }
 
         if (activities?.container) {
@@ -1478,6 +1482,7 @@ export default class SpatialOverviewExtension extends Extension {
             if (parent)
                 parent.remove_child(dateMenu.container);
             panel?._centerBox?.insert_child_at_index(dateMenu.container, 0);
+            dateMenu.remove_style_class_name('spatial-clock-left');
         }
 
         if (activities?.container) {

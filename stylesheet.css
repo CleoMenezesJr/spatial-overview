@@ -12,3 +12,24 @@
   background-size: contain;
   width: 24px;
 }
+
+/* FIXME downstream: PanelMenu.ButtonBox insets its child by -natural-hpadding
+   on both sides (panelMenu.js:71-78, 12px from the theme's
+   `#panel .panel-button` rule). For .clock-display the theme disables the
+   button's own background (`background: none !important`) and paints the pill
+   on the inner .clock instead, so that inset is dead space in front of the
+   pill rather than part of it. Centered - where upstream puts the clock - it
+   reads as symmetric breathing room; moved to the left edge by
+   _patchPanelLayout it becomes a 12px gap that keeps the pill off the screen
+   edge and costs the Fitts target the edge would give.
+
+   Zeroing it puts .clock at x=0, and its own 3px transparent border
+   (gnome-shell-dark.css:1888-1891) leaves the pill starting at x=3 - the same
+   offset #panelActivities had when upstream owned this corner.
+
+   Ideal upstream fix: let ButtonBox take asymmetric padding, so an item at a
+   panel edge can drop only the edge-facing side. */
+#panel .panel-button.clock-display.spatial-clock-left {
+  -natural-hpadding: 0;
+  -minimum-hpadding: 0;
+}
