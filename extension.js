@@ -22,6 +22,7 @@ const BACKDROP_OPACITY = 180;
 const MIN_WS_SCALE = 0.18;
 const WORKSPACE_CUT_SIZE = 10; // workspaceThumbnail.js:27
 const MIN_WORKSPACES = 3;
+const WORKSPACE_DOT_DURATION = 500; // panel.js:114,125
 const PLACEHOLDER_WIDTH = 24;
 
 // Replicates _getRealActorScale from dnd.js (not exported upstream).
@@ -240,8 +241,10 @@ export default class SpatialOverviewExtension extends Extension {
         this._sessionModeUpdatedId = 0;
         this._minWorkspacesId = 0;
         this._panelPatched = false;
+        this._workspaceDotProto = null;
 
         this._patchPanelLayout();
+        this._patchWorkspaceDots();
         this._patchDraggableCaptureOrigin();
         this._patchFitAllLayout();
 
@@ -554,6 +557,7 @@ export default class SpatialOverviewExtension extends Extension {
         this._restoreDraggableCaptureOrigin();
         this._restoreFitAllLayout();
         this._restorePanelLayout();
+        this._restoreWorkspaceDots();
         this._dragActive = false;
 
         if (this._zoomOutView) {
@@ -1370,6 +1374,128 @@ export default class SpatialOverviewExtension extends Extension {
                 }
             }
         }
+    }
+
+    _getWorkspaceIndicators() {
+        // ActivitiesButton adds exactly one child, the WorkspaceIndicators box
+        // (panel.js:211).
+        return Main.panel?.statusArea?.activities?.get_first_child() ?? null;
+    }
+
+    // FIXME downstream: WorkspaceDot.scaleIn/scaleOutAndDestroy (panel.js:
+    // 107-131) animate scale_x/scale_y only. Scale is a paint-time transform;
+    // it never reaches vfunc_get_preferred_width (panel.js:91-94), which sizes
+    // the dot purely from expansion * widthMultiplier. So the BoxLayout keeps
+    // allocating a dying dot its full width for the whole 500ms and reclaims
+    // it in one step inside destroy().
+    //
+    // Measured in the nested shell, removing a workspace (4 -> 3 dots):
+    // scale_x runs 1.00 -> 0.00 while the dot's preferred width stays 8px, so
+    // the row holds a hole the dot no longer paints into; at +540ms destroy()
+    // fires and the row snaps 13px (8px dot + 5px BoxLayout spacing). With
+    // Activities in _centerBox that snap is halved into a 6px sideways jump of
+    // the whole row, because Panel.vfunc_allocate centers it (panel.js:512).
+    //
+    // The fix belongs in vfunc_get_preferred_width, but it cannot go there
+    // from an extension: GJS wires vfuncs into the class vtable at
+    // GObject.registerClass time, so replacing prototype.
+    // vfunc_get_preferred_width afterwards is silently ignored. Verified in
+    // the nested shell - the override never ran, preferred width stayed 8px
+    // across a full scale_x 1.00 -> 0.00 sweep. So we drive set_width from
+    // notify::scale-x instead, which reaches the same layout input by the only
+    // route an extension has.
+    //
+    // Ideal upstream fix: multiply the scale factor into
+    // WorkspaceDot.vfunc_get_preferred_width and queue_relayout on
+    // notify::scale-x, so layout and paint share one source of truth. That
+    // also drops the set_width dance below.
+    _patchWorkspaceDots() {
+        const dot = this._getWorkspaceIndicators()?.get_first_child();
+        if (!dot)
+            return;
+
+        const proto = Object.getPrototypeOf(dot);
+        if (proto._spatialOrigScaleIn)
+            return;
+
+        proto._spatialOrigScaleIn = proto.scaleIn;
+        proto._spatialOrigScaleOutAndDestroy = proto.scaleOutAndDestroy;
+
+        // Re-derived every frame rather than pinned once: _recalculateDots
+        // calls scaleIn/scaleOutAndDestroy before _updateExpansion
+        // (panel.js:158-176), so the natural width at animation start is stale
+        // - a dot born as the active one is 8px here and 26px a tick later.
+        // Clearing the override first is what makes get_preferred_width report
+        // the current expansion * widthMultiplier instead of our own value.
+        const syncWidth = dot => {
+            dot.set_width(-1);
+            const [, natWidth] = dot.get_preferred_width(-1);
+            dot.set_width(Math.round(natWidth * dot.scale_x));
+        };
+        const trackWidth = dot =>
+            dot.connect('notify::scale-x', () => syncWidth(dot));
+
+        proto.scaleIn = function () {
+            this.set({scale_x: 0, scale_y: 0});
+            const id = trackWidth(this);
+            syncWidth(this);
+            this.ease({
+                duration: WORKSPACE_DOT_DURATION,
+                mode: Clutter.AnimationMode.EASE_OUT_CUBIC,
+                scale_x: 1.0,
+                scale_y: 1.0,
+                onStopped: () => {
+                    this.disconnect(id);
+                    this.set_width(-1);
+                },
+            });
+        };
+
+        // EASE_IN_CUBIC, not upstream's EASE_OUT_CUBIC. The removal is the
+        // reversal of scaleIn, so it wants the mirrored curve; sharing
+        // EASE_OUT_CUBIC front-loads a shrink instead. Measured with upstream's
+        // curve: width fell 8px -> 1px inside the first 300ms, held ~0 for the
+        // remaining 200ms, and only then did destroy() release the row's 5px
+        // BoxLayout spacing - motion, stall, isolated jump.
+        //
+        // That 5px belongs to the box, not the dot, so no per-child property
+        // can animate it away (Clutter clamps margins at >= 0). scaleIn hides
+        // it by spending it at t=0, under the growth that follows. Mirroring
+        // the curve buys the same cover on the way out: the dot now holds its
+        // width and collapses into the final frames, so the spacing is
+        // reclaimed while the row is moving fastest rather than after it
+        // stopped.
+        proto.scaleOutAndDestroy = function () {
+            this._destroying = true;
+            trackWidth(this);
+            this.ease({
+                duration: WORKSPACE_DOT_DURATION,
+                mode: Clutter.AnimationMode.EASE_IN_CUBIC,
+                scale_x: 0.0,
+                scale_y: 0.0,
+                onComplete: () => this.destroy(),
+            });
+        };
+
+        this._workspaceDotProto = proto;
+        logTime('_patchWorkspaceDots: dot width follows scale');
+    }
+
+    _restoreWorkspaceDots() {
+        const proto = this._workspaceDotProto;
+        if (!proto)
+            return;
+
+        proto.scaleIn = proto._spatialOrigScaleIn;
+        proto.scaleOutAndDestroy = proto._spatialOrigScaleOutAndDestroy;
+        delete proto._spatialOrigScaleIn;
+        delete proto._spatialOrigScaleOutAndDestroy;
+
+        for (const dot of this._getWorkspaceIndicators()?.get_children() ?? [])
+            dot.set_width(-1);
+
+        this._workspaceDotProto = null;
+        logTime('_restoreWorkspaceDots');
     }
 
     // FIXME downstream: panel item positions are hardcoded in sessionMode.js
