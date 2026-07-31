@@ -1,3 +1,7 @@
+// Proof of concept. A pile of shitty monkey-patches whose only real purpose
+// is to document possible upstream changes - see the `FIXME downstream`
+// comments. Don't read the rest.
+
 import GObject from 'gi://GObject';
 import Clutter from 'gi://Clutter';
 import GLib from 'gi://GLib';
