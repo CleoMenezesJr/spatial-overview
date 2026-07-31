@@ -239,7 +239,7 @@ export default class SpatialOverviewExtension extends Extension {
         this._dropInsertIndex = -1;
         this._dropWorkspaceIndex = -1;
         this._sessionModeUpdatedId = 0;
-        this._minWorkspacesId = 0;
+        this._minWorkspacesProto = null;
         this._panelPatched = false;
         this._workspaceDotProto = null;
 
@@ -254,12 +254,7 @@ export default class SpatialOverviewExtension extends Extension {
 
         this._overrideThumbnailsShouldShow();
 
-        if (Meta.prefs_get_dynamic_workspaces()) {
-            this._minWorkspacesId = global.workspace_manager.connect(
-                'workspace-removed',
-                () => this._ensureMinWorkspaces(MIN_WORKSPACES));
-            this._ensureMinWorkspaces(MIN_WORKSPACES);
-        }
+        this._patchMinWorkspaces();
 
         this._progressSignalId = this._zoomOutView._progressAdj.connect(
             'notify::value', () => {
@@ -515,10 +510,7 @@ export default class SpatialOverviewExtension extends Extension {
     }
 
     disable() {
-        if (this._minWorkspacesId) {
-            global.workspace_manager.disconnect(this._minWorkspacesId);
-            this._minWorkspacesId = 0;
-        }
+        this._restoreMinWorkspaces();
 
         if (this._dragActive)
             this._onDragEnd();
@@ -1333,15 +1325,67 @@ export default class SpatialOverviewExtension extends Extension {
         return Main.overview?._overview?.controls?._thumbnailsBox ?? null;
     }
 
-    // FIXME downstream: upstream keeps min(nWorkspaces)=2 with dynamic
-    // workspaces (1 occupied + 1 empty). This patch raises the floor to
-    // MIN_WORKSPACES. Upstream fix: make the min configurable in mutter's
-    // MetaWorkspaceManager or expose a setting in gnome-shell.
-    _ensureMinWorkspaces(min) {
+    // FIXME downstream: the dynamic-workspace floor is upstream's, spelled
+    // MIN_NUM_WORKSPACES = 2 in windowManager.js:42 and read only inside
+    // WorkspaceTracker._checkWorkspaces (windowManager.js:273,286). That
+    // method is the single authority: it runs on a BEFORE_REDRAW later after
+    // any workspace change and deletes empty workspaces down to its own floor.
+    //
+    // Topping the count up from outside cannot work, and the previous revision
+    // of this patch showed why: appending fires notify::n-workspaces, which
+    // queues _checkWorkspaces, which deletes what we just added, which emits
+    // workspace-removed, which made us append again. The nested-shell log has
+    // that add/remove ping-pong on every startup, and the count settled
+    // wherever the loop happened to stall (3 occupied + 2 empty was one).
+    //
+    // So veto the deletion instead of racing it. _checkWorkspaces reaches
+    // removal through `workspaceManager.remove_workspace(...)`, an ordinary
+    // JS property lookup, so shadowing it on the prototype makes upstream stop
+    // exactly where a higher MIN_NUM_WORKSPACES would have stopped it - its
+    // own loop guard is `n_workspaces === MIN_NUM_WORKSPACES`. Every other
+    // rule stays upstream's, including "keep one empty workspace at the end",
+    // so above the floor the count still tracks usage instead of pinning two
+    // spare workspaces.
+    //
+    // Ideal upstream fix: make MIN_NUM_WORKSPACES configurable (GSettings key
+    // read by _checkWorkspaces). Then both the veto and the top-up below go.
+    _patchMinWorkspaces() {
+        if (!Meta.prefs_get_dynamic_workspaces())
+            return;
+
         const mgr = global.workspace_manager;
-        while (mgr.n_workspaces < min)
-            Main.wm.insertWorkspace(mgr.n_workspaces);
-        logTime('_ensureMinWorkspaces', {n: mgr.n_workspaces});
+        const proto = mgr.constructor.prototype;
+
+        if (!proto._spatialOrigRemoveWorkspace) {
+            proto._spatialOrigRemoveWorkspace = proto.remove_workspace;
+            proto.remove_workspace = function (workspace, time) {
+                if (this.n_workspaces <= MIN_WORKSPACES) {
+                    logTime('remove_workspace vetoed at floor',
+                        {n: this.n_workspaces});
+                    return;
+                }
+                proto._spatialOrigRemoveWorkspace.call(this, workspace, time);
+            };
+            this._minWorkspacesProto = proto;
+        }
+
+        // Only needed to reach the floor the first time; with the veto in
+        // place nothing drops us back below it, so this does not re-arm.
+        while (mgr.n_workspaces < MIN_WORKSPACES)
+            mgr.append_new_workspace(false, global.get_current_time());
+
+        logTime('_patchMinWorkspaces', {n: mgr.n_workspaces});
+    }
+
+    _restoreMinWorkspaces() {
+        const proto = this._minWorkspacesProto;
+        if (!proto)
+            return;
+
+        proto.remove_workspace = proto._spatialOrigRemoveWorkspace;
+        delete proto._spatialOrigRemoveWorkspace;
+        this._minWorkspacesProto = null;
+        logTime('_restoreMinWorkspaces');
     }
 
     _restoreWorkspacesState() {
