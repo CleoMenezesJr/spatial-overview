@@ -239,6 +239,8 @@ export default class SpatialOverviewExtension extends Extension {
         this._dragBeginId = null;
         this._dragEndId = null;
         this._dragCancelledId = null;
+        this._overviewHidingId = null;
+        this._escapeCapturedId = 0;
         this._progressSignalId = null;
         this._fitModeNotifyId = 0;
         this._fitModeNotifyAdj = null;
@@ -287,6 +289,13 @@ export default class SpatialOverviewExtension extends Extension {
                 logTime('SIGNAL window-drag-cancelled from overview');
                 this._onDragEnd(true);
             });
+        // Fit-all now outlives the drag, so it can also outlive the overview.
+        // The leave animation reads the workspace geometry, and in FitMode.ALL
+        // that geometry is the shrunken one.
+        this._overviewHidingId = Main.overview.connect('hiding', () => {
+            if (this._spatialEngaged)
+                this._leaveFitAll();
+        });
     }
 
     // FIXME downstream: _getRestoreLocation (dnd.js:453) reads the drag origin
@@ -551,6 +560,19 @@ export default class SpatialOverviewExtension extends Extension {
             Main.overview.disconnect(this._dragCancelledId);
             this._dragCancelledId = null;
         }
+        if (this._overviewHidingId) {
+            Main.overview.disconnect(this._overviewHidingId);
+            this._overviewHidingId = null;
+        }
+
+        this._disarmFitAllEscape();
+        // The adjustment is the shell's own. Disabling while held in fit-all
+        // would leave it there with nothing left to ease it back.
+        const fitAdj = this._getWsDisplay()?._fitModeAdjustment;
+        if (this._spatialEngaged && fitAdj) {
+            fitAdj.remove_transition('value');
+            fitAdj.value = FitMode.SINGLE;
+        }
 
         this._disconnectFitModeNotify();
         this._removeRestoreIdle();
@@ -573,6 +595,12 @@ export default class SpatialOverviewExtension extends Extension {
     _onDragBegin(metaWindow) {
         logTime('_onDragBegin ENTER (zoom-out held back)');
         this._dragActive = true;
+        // A drag started from a held fit-all: Esc is dnd's for its duration, it
+        // cancels the drag (dnd.js:568-570). Which of the two handlers the key
+        // reaches first is not ours to assume - dnd's grab redirects events to
+        // its own actor and skips the capture phase we listen on (dnd.js:44-45)
+        // - so disarm instead of racing. _onDragEnd arms it again.
+        this._disarmFitAllEscape();
         const self = this;
         this._draggedMetaWindow = metaWindow;
 
@@ -1003,37 +1031,19 @@ export default class SpatialOverviewExtension extends Extension {
         this._clearDragPlaceholder();
 
         const ws = this._getWsDisplay();
-        // Not value alone: a drop landing within a frame of _engageSpatialLayout
-        // finds the ease to FitMode.ALL queued but not yet advanced, so the
-        // value still reads exactly SINGLE while a zoom-out is in flight.
-        // Taking the no-op branch there left that ease running with nothing to
-        // undo it, stranding the overview in fit-all.
-        const fitAdj = ws?._fitModeAdjustment;
-        const alreadyChanged = fitAdj?.value === FitMode.SINGLE &&
-            !fitAdj?.get_transition('value');
-        if (!alreadyChanged && fitAdj && this._spatialLayoutActive()) {
-            logTime('_onDragEnd: starting zoom-in ease to FitMode.SINGLE', {isCancel});
-            ws._fitModeAdjustment.remove_transition('value');
-            ws._fitModeAdjustment.ease(FitMode.SINGLE, {
-                duration: ZOOM_IN_DURATION,
-                mode: Clutter.AnimationMode.EASE_OUT_CUBIC,
-                onStopped: () => {
-                    // Not earlier: the ease allocates on every frame, and each
-                    // allocation asks _spatialLayoutActive.
-                    this._spatialEngaged = false;
-                    this._removeRestoreIdle();
-                    this._restoreIdleId = GLib.idle_add(
-                        GLib.PRIORITY_DEFAULT, () => {
-                            this._restoreIdleId = 0;
-                            this._restoreWorkspacesState();
-                            return GLib.SOURCE_REMOVE;
-                        });
-                },
-            });
+
+        // Releasing the window is not what leaves fit-all - Esc is. A drag that
+        // never got as far as zooming out has nothing to hold, so it still
+        // unwinds here.
+        //
+        // Cancelled drags hold too. Esc during a drag already means "cancel the
+        // drag" (dnd.js:568-570), so a cancel that also left fit-all would make
+        // one key do two things. The second Esc is the one that leaves.
+        if (this._spatialLayoutActive()) {
+            logTime('_onDragEnd: holding fit-all', {isCancel});
+            this._armFitAllEscape();
         } else {
-            logTime('_onDragEnd: no zoom-in', {
-                isCancel, engaged: this._spatialEngaged,
-            });
+            logTime('_onDragEnd: not engaged, nothing to hold', {isCancel});
             this._spatialEngaged = false;
             this._restoreWorkspacesState();
         }
@@ -1047,6 +1057,74 @@ export default class SpatialOverviewExtension extends Extension {
 
         if (this._zoomOutView?.visible)
             this._zoomOutView.hide();
+    }
+
+    // Esc is the way out of fit-all. Capture phase, which is upstream's own
+    // idiom for the same key (grabHelper.js:168-176): the search controller
+    // takes Esc on the stage's key-press-event and turns it into
+    // Main.overview.hide() (searchController.js:152-158), and that handler is
+    // reconnected on every overview show, so it would always be the newer of
+    // the two in the bubble phase.
+    _armFitAllEscape() {
+        if (this._escapeCapturedId)
+            return;
+
+        this._escapeCapturedId = global.stage.connect('captured-event',
+            (_actor, event) => {
+                if (event.type() !== Clutter.EventType.KEY_PRESS ||
+                    event.get_key_symbol() !== Clutter.KEY_Escape)
+                    return Clutter.EVENT_PROPAGATE;
+
+                logTime('Esc: leaving fit-all');
+                this._leaveFitAll();
+                return Clutter.EVENT_STOP;
+            });
+    }
+
+    _disarmFitAllEscape() {
+        if (!this._escapeCapturedId)
+            return;
+
+        global.stage.disconnect(this._escapeCapturedId);
+        this._escapeCapturedId = 0;
+    }
+
+    _leaveFitAll() {
+        this._disarmFitAllEscape();
+
+        // Not value alone: a drop landing within a frame of _engageSpatialLayout
+        // finds the ease to FitMode.ALL queued but not yet advanced, so the
+        // value still reads exactly SINGLE while a zoom-out is in flight.
+        // Taking the no-op branch there left that ease running with nothing to
+        // undo it, stranding the overview in fit-all.
+        const fitAdj = this._getWsDisplay()?._fitModeAdjustment;
+        const alreadyChanged = fitAdj?.value === FitMode.SINGLE &&
+            !fitAdj?.get_transition('value');
+        if (alreadyChanged || !fitAdj || !this._spatialLayoutActive()) {
+            logTime('_leaveFitAll: no zoom-in', {engaged: this._spatialEngaged});
+            this._spatialEngaged = false;
+            this._restoreWorkspacesState();
+            return;
+        }
+
+        logTime('_leaveFitAll: starting zoom-in ease to FitMode.SINGLE');
+        fitAdj.remove_transition('value');
+        fitAdj.ease(FitMode.SINGLE, {
+            duration: ZOOM_IN_DURATION,
+            mode: Clutter.AnimationMode.EASE_OUT_CUBIC,
+            onStopped: () => {
+                // Not earlier: the ease allocates on every frame, and each
+                // allocation asks _spatialLayoutActive.
+                this._spatialEngaged = false;
+                this._removeRestoreIdle();
+                this._restoreIdleId = GLib.idle_add(
+                    GLib.PRIORITY_DEFAULT, () => {
+                        this._restoreIdleId = 0;
+                        this._restoreWorkspacesState();
+                        return GLib.SOURCE_REMOVE;
+                    });
+            },
+        });
     }
 
     // Gives back the slots dropped at engagement, once the container owns the
