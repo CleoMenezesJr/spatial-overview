@@ -15,6 +15,7 @@ import * as DND from 'resource:///org/gnome/shell/ui/dnd.js';
 import {FitMode, WorkspacesView} from 'resource:///org/gnome/shell/ui/workspacesView.js';
 import {ControlsState} from 'resource:///org/gnome/shell/ui/overviewControls.js';
 import {HotCorner} from 'resource:///org/gnome/shell/ui/layout.js';
+import {WindowPreview} from 'resource:///org/gnome/shell/ui/windowPreview.js';
 
 const TAG = '[SPATIAL-WS]';
 const DEBUG = GLib.getenv('SPATIAL_WS_DEBUG') !== null;
@@ -23,6 +24,9 @@ const logTime = DEBUG
     : () => {};
 const ZOOM_OUT_DURATION = 210;
 const ZOOM_IN_DURATION = 400;
+// Shorter than ZOOM_IN_DURATION: this zoom-in has the overview's own leave
+// animation queued behind it.
+const ZOOM_IN_ACTIVATE_DURATION = 200;
 const ZOOM_OUT_HOLD_DELAY = 150;
 const BACKDROP_OPACITY = 180;
 const MIN_WS_SCALE = 0.18;
@@ -244,6 +248,7 @@ export default class SpatialOverviewExtension extends Extension {
         this._patchPanelLayout();
         this._patchWorkspaceDots();
         this._patchHotCorner();
+        this._patchPreviewActivate();
         this._patchFitAllLayout();
 
         this._zoomOutView = new ZoomOutView();
@@ -274,12 +279,14 @@ export default class SpatialOverviewExtension extends Extension {
                 logTime('SIGNAL window-drag-cancelled from overview');
                 this._onDragEnd(true);
             });
-        // Fit-all now outlives the drag, so it can also outlive the overview.
-        // The leave animation reads the workspace geometry, and in FitMode.ALL
-        // that geometry is the shrunken one.
+        // Fit-all now outlives the drag, so it can also outlive the overview:
+        // clicking a window preview activates it (workspace.js:1393-1397) and
+        // that hides the overview from under us. The leave animation reads the
+        // workspace geometry, and in FitMode.ALL that geometry is the shrunken
+        // one.
         this._overviewHidingId = Main.overview.connect('hiding', () => {
             if (this._spatialEngaged)
-                this._leaveFitAll();
+                this._leaveFitAll({animate: false});
         });
     }
 
@@ -487,6 +494,7 @@ export default class SpatialOverviewExtension extends Extension {
         this._removeEngageTimeout();
         this._spatialEngaged = false;
         this._restoreWorkspacesState();
+        this._restorePreviewActivate();
         this._restoreFitAllLayout();
         this._restorePanelLayout();
         this._restoreWorkspaceDots();
@@ -934,6 +942,57 @@ export default class SpatialOverviewExtension extends Extension {
             this._zoomOutView.hide();
     }
 
+    // FIXME downstream: in FitMode.ALL the first click on a preview two
+    // workspaces over is spent selecting that workspace. _onCloneSelected only
+    // activates the window when _shouldLeaveOverview() agrees, and for an
+    // inactive workspace at WINDOW_PICKER it does not (workspace.js:1111-1117,
+    // 1393-1399), so the window needs a second click. That reading fits
+    // FitMode.SINGLE, where the neighbours only peek in from the edges; with
+    // every workspace fully on screen the click already has a target.
+    // Ideal upstream fix: let _shouldLeaveOverview account for the fit mode.
+    //
+    // The hook is _activate and not _onCloneSelected: the latter is bound per
+    // clone at connect time (workspace.js:1339-1340), so replacing it on a
+    // Workspace changes nothing. The click gesture reaches _activate through an
+    // arrow (windowPreview.js:118-119), and the prototype also covers previews
+    // built after the hold started - a cross-workspace drop rebuilds one.
+    _patchPreviewActivate() {
+        if (this._origPreviewActivate)
+            return;
+
+        const self = this;
+        const orig = WindowPreview.prototype._activate;
+        this._origPreviewActivate = orig;
+
+        WindowPreview.prototype._activate = function () {
+            if (!self._spatialLayoutActive()) {
+                orig.call(this);
+                return;
+            }
+
+            const metaWindow = this.metaWindow;
+            const time = global.get_current_time();
+            const wsIndex = metaWindow.get_workspace()?.index() ?? -1;
+            logTime('click on preview: zoom in, then activate', {wsIndex});
+            // The window comes after the zoom-in rather than with it:
+            // Main.activateWindow hides the overview (main.js:859), and the
+            // leave animation starts from whatever picture it finds.
+            self._leaveFitAll({
+                duration: ZOOM_IN_ACTIVATE_DURATION,
+                scrollTo: wsIndex,
+                onDone: () => Main.activateWindow(metaWindow, time),
+            });
+        };
+    }
+
+    _restorePreviewActivate() {
+        if (!this._origPreviewActivate)
+            return;
+
+        WindowPreview.prototype._activate = this._origPreviewActivate;
+        this._origPreviewActivate = null;
+    }
+
     // Esc is the way out of fit-all. Capture phase, which is upstream's own
     // idiom for the same key (grabHelper.js:168-176): the search controller
     // takes Esc on the stage's key-press-event and turns it into
@@ -964,8 +1023,31 @@ export default class SpatialOverviewExtension extends Extension {
         this._escapeCapturedId = 0;
     }
 
-    _leaveFitAll() {
+    _leaveFitAll({animate = true, onDone = null, scrollTo = -1,
+        duration = ZOOM_IN_DURATION} = {}) {
         this._disarmFitAllEscape();
+
+        // The overview is already going. prepareToLeaveOverview freezes each
+        // WorkspaceLayout (workspace.js:1299) before 'hiding' is emitted
+        // (overview.js:574-575), so the slots are fixed by the time we get here
+        // and the pin makes them the FitMode.SINGLE ones. Only the workspace
+        // transform is left, and easing it would run alongside the leave
+        // animation rather than before it.
+        if (!animate) {
+            logTime('_leaveFitAll: snapping to FitMode.SINGLE');
+            this._spatialEngaged = false;
+            const adj = this._getWsDisplay()?._fitModeAdjustment;
+            if (adj) {
+                adj.remove_transition('value');
+                adj.value = FitMode.SINGLE;
+            }
+            // remove_transition above stops any zoom-in ease, and its onStopped
+            // queues a restore. Drop it: this one runs now.
+            this._removeRestoreIdle();
+            this._restoreWorkspacesState();
+            onDone?.();
+            return;
+        }
 
         // Not value alone: a drop landing within a frame of _engageSpatialLayout
         // finds the ease to FitMode.ALL queued but not yet advanced, so the
@@ -979,13 +1061,30 @@ export default class SpatialOverviewExtension extends Extension {
             logTime('_leaveFitAll: no zoom-in', {engaged: this._spatialEngaged});
             this._spatialEngaged = false;
             this._restoreWorkspacesState();
+            onDone?.();
             return;
         }
 
-        logTime('_leaveFitAll: starting zoom-in ease to FitMode.SINGLE');
+        logTime('_leaveFitAll: starting zoom-in ease to FitMode.SINGLE',
+            {duration, scrollTo});
+        // The zoom-in resolves onto whichever workspace the scroll position
+        // names, so a click two workspaces over has to carry it along.
+        // activate_with_focus gets there on its own, but only afterwards -
+        // _scrollToActive runs off the switch-workspace signal
+        // (workspacesView.js:406-419), which is the slide across that shows up
+        // between the zoom-in and the desktop.
+        const scrollAdj = this._getWsDisplay()?._scrollAdjustment;
+        if (scrollTo >= 0 && scrollAdj && scrollAdj.value !== scrollTo) {
+            scrollAdj.remove_transition('value');
+            scrollAdj.ease(scrollTo, {
+                duration,
+                mode: Clutter.AnimationMode.EASE_OUT_CUBIC,
+            });
+        }
+
         fitAdj.remove_transition('value');
         fitAdj.ease(FitMode.SINGLE, {
-            duration: ZOOM_IN_DURATION,
+            duration,
             mode: Clutter.AnimationMode.EASE_OUT_CUBIC,
             onStopped: () => {
                 // Not earlier: the ease allocates on every frame, and each
@@ -998,6 +1097,7 @@ export default class SpatialOverviewExtension extends Extension {
                         this._restoreWorkspacesState();
                         return GLib.SOURCE_REMOVE;
                     });
+                onDone?.();
             },
         });
     }
