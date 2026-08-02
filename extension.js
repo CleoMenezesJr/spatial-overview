@@ -1112,8 +1112,9 @@ export default class SpatialOverviewExtension extends Extension {
     // the zoom does it every frame.
     // Ideal upstream fix: skip slots whose actor the container no longer parents.
     _detachDraggedSlots(lm, container) {
+        const children = new Set(container.get_children());
         for (let i = lm._windowSlots.length - 1; i >= 0; i--) {
-            if (lm._windowSlots[i][4].get_parent() === container)
+            if (children.has(lm._windowSlots[i][4]))
                 continue;
             lm._spatialDetached.push([i, lm._windowSlots[i]]);
             lm._windowSlots.splice(i, 1);
@@ -1141,8 +1142,12 @@ export default class SpatialOverviewExtension extends Extension {
                     lm._spatialDetached = [];
                     continue;
                 }
+                // Asked of the container, not of the actor: a cross-workspace
+                // drop destroys the preview, and get_parent() on the disposed
+                // wrapper is a Gjs-CRITICAL. Set membership never reaches C.
+                const children = new Set(container.get_children());
                 lm._spatialDetached = lm._spatialDetached.filter(([i, slot]) => {
-                    if (slot[4].get_parent() !== container)
+                    if (!children.has(slot[4]))
                         return true;
                     lm._windowSlots.splice(
                         Math.min(i, lm._windowSlots.length), 0, slot);
