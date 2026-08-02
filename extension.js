@@ -34,20 +34,6 @@ const WORKSPACE_DOT_DURATION = 500; // panel.js:114,125
 const HOT_CORNER_WIDTH_FACTOR = 5;
 const PLACEHOLDER_WIDTH = 24;
 
-// Replicates _getRealActorScale from dnd.js (not exported upstream).
-// Walks up the actor tree multiplying scale_x - needed to compute
-// the FitMode.SINGLE stage position of the clone's parent (workspace
-// thumbnail) before our zoom-out has changed it.
-function _getRealActorScale(actor) {
-    let scale = 1.0;
-    let current = actor;
-    while (current) {
-        scale *= current.scale_x;
-        current = current.get_parent();
-    }
-    return scale;
-}
-
 const ZoomOutView = GObject.registerClass({
     Signals: {
         'workspace-activated': {param_types: [GObject.TYPE_INT]},
@@ -258,7 +244,6 @@ export default class SpatialOverviewExtension extends Extension {
         this._patchPanelLayout();
         this._patchWorkspaceDots();
         this._patchHotCorner();
-        this._patchDraggableCaptureOrigin();
         this._patchFitAllLayout();
 
         this._zoomOutView = new ZoomOutView();
@@ -296,83 +281,6 @@ export default class SpatialOverviewExtension extends Extension {
             if (this._spatialEngaged)
                 this._leaveFitAll();
         });
-    }
-
-    // FIXME downstream: _getRestoreLocation (dnd.js:453) reads the drag origin
-    // parent's transformed position at drop time (dnd.js:465-466), when our
-    // zoom-out has already moved it to FitMode.ALL. Capture the FitMode.SINGLE
-    // transform at gesture recognition instead.
-    // Ideal upstream fix: snapshot the restore location in _gestureRecognized,
-    // where _dragOrigParent/_dragOrigX/Y/Scale are already recorded, or take it
-    // as a makeDraggable() param. Same for _getRealActorScale (dnd.js:54),
-    // private upstream and replicated above.
-    //
-    // _Draggable isn't exported, so reach its prototype via a throwaway
-    // draggable. Patching once here beats hooking a clone constructor, which
-    // re-wraps the prototype per instance and can't be undone.
-    _patchDraggableCaptureOrigin() {
-        if (this._draggablePatched)
-            return;
-
-        const dummy = new Clutter.Actor();
-        const dragProto = Object.getPrototypeOf(DND.makeDraggable(dummy));
-        dummy.destroy();
-
-        if (!dragProto?._gestureRecognized) {
-            logTime('_Draggable prototype not found!');
-            return;
-        }
-
-        // maps metaWindow -> FitMode.SINGLE parent pos+scale for snap-back
-        this._fitSingleByMetaWindow = new Map();
-
-        const ext = this;
-        const origGestureRecognized = dragProto._gestureRecognized;
-        this._dragProto = dragProto;
-        this._origGestureRecognized = origGestureRecognized;
-
-        dragProto._gestureRecognized = function () {
-            const result = origGestureRecognized.call(this);
-            // _dragOrigParent is set inside _gestureRecognized (dnd.js:199) and
-            // still holds the FitMode.SINGLE transform: our ease was only queued.
-            // dnd.js nulls it on destroy, so get_stage() is all we need to know
-            // the transform is meaningful.
-            const parent = this._dragOrigParent;
-            if (parent?.get_stage()) {
-                const mw = this.actor?._delegate?.metaWindow
-                    ?? this.actor?.meta_window
-                    ?? this.actor?.metaWindow;
-                if (mw) {
-                    const [px, py] = parent.get_transformed_position();
-                    const ps = _getRealActorScale(parent);
-                    if (Number.isFinite(px) && Number.isFinite(py)) {
-                        ext._fitSingleByMetaWindow.set(mw, {px, py, scale: ps});
-                        // Not every recognized gesture reaches our drag
-                        // monitor, so the entry can't be dropped where it's
-                        // read.
-                        const id = this.connect('drag-end', () => {
-                            ext._fitSingleByMetaWindow?.delete(mw);
-                            this.disconnect(id);
-                        });
-                    }
-                }
-            }
-            return result;
-        };
-
-        this._draggablePatched = true;
-    }
-
-    _restoreDraggableCaptureOrigin() {
-        if (!this._draggablePatched)
-            return;
-        if (this._dragProto && this._origGestureRecognized)
-            this._dragProto._gestureRecognized = this._origGestureRecognized;
-        this._origGestureRecognized = null;
-        this._dragProto = null;
-        this._draggablePatched = false;
-        this._fitSingleByMetaWindow?.clear();
-        this._fitSingleByMetaWindow = null;
     }
 
     // FIXME downstream: Upstream _getFirstFitAllWorkspaceBox divides available
@@ -579,7 +487,6 @@ export default class SpatialOverviewExtension extends Extension {
         this._removeEngageTimeout();
         this._spatialEngaged = false;
         this._restoreWorkspacesState();
-        this._restoreDraggableCaptureOrigin();
         this._restoreFitAllLayout();
         this._restorePanelLayout();
         this._restoreWorkspaceDots();
@@ -616,75 +523,56 @@ export default class SpatialOverviewExtension extends Extension {
                 this._draggedMetaWindow = dragEvent.source?.metaWindow || this._draggedMetaWindow;
                 if (!this._activeDraggable && dragEvent.source?._draggable) {
                     this._activeDraggable = dragEvent.source._draggable;
-                    // lookup here, not in _onDragBegin: patched _gestureRecognized
-                    // populates the map synchronously AFTER origGR triggers
-                    // drag-begin then window-drag-begin, so reading it in
-                    // _onDragBegin always sees an empty map
-                    self._fitSingleParent = self._fitSingleByMetaWindow?.get(this._draggedMetaWindow) ?? null;
-                    // FIXME downstream: GNOME's _getRestoreLocation uses the
-                    // parent's *current* transformed position at snap-back
-                    // time. During our zoom-out (FitMode.ALL) the parent is
-                    // repositioned, so the snap-back would target FitMode.ALL.
-                    // We replace it with the clone's captured FitMode.SINGLE
-                    // stage position (captured in patched Draggable._gestureRecognized).
                     const draggable = this._activeDraggable;
+
+                    // FIXME downstream: _getRestoreLocation reads the drag
+                    // origin parent's transform at drop time (dnd.js:465-470),
+                    // but _dragOrigX/Y are the clone's allocation inside that
+                    // parent as it stood at gesture recognition (dnd.js:202).
+                    // A drag that starts in FitMode.SINGLE and is dropped in
+                    // FitMode.ALL has the two describing different geometries:
+                    // the container is narrower and WorkspaceLayout multiplies
+                    // every slot by slotsScale (workspace.js:683), so the
+                    // snap-back aims at the fit-single slot and
+                    // _onAnimationComplete then reparents the clone onto the
+                    // fit-all one (dnd.js:519-524). Their difference is the
+                    // jump. A drag begun with fit-all already held has none:
+                    // there the two readings agree.
+                    // Ideal upstream fix: record the restore location as a
+                    // fraction of the parent rather than in pixels.
+                    const origParentWidth =
+                        draggable._dragOrigParent?.get_width() ?? 0;
                     this._origGetRestoreLocation = draggable._getRestoreLocation;
                     draggable._getRestoreLocation = function () {
-                        if (self._fitSingleParent) {
-                            // _fitSingleParent has the FitMode.SINGLE parent stage pos+scale.
-                            // _dragOrigX/Y are the clone's allocation within the parent (FitMode.SINGLE).
-                            // Compute the clone's FitMode.SINGLE stage position.
-                            const p = self._fitSingleParent;
-                            return [
-                                p.px + p.scale * this._dragOrigX,
-                                p.py + p.scale * this._dragOrigY,
-                                this._dragOrigScale * p.scale,
-                            ];
-                        }
-                        return self._origGetRestoreLocation.call(this);
+                        const [x, y, scale] =
+                            self._origGetRestoreLocation.call(this);
+                        const parent = this._dragOrigParent;
+                        if (this._dragActorSource || !parent?.get_stage() ||
+                            !(origParentWidth > 0))
+                            return [x, y, scale];
+
+                        const s = parent.get_width() / origParentWidth;
+                        if (s === 1)
+                            return [x, y, scale];
+
+                        // x is parentX + parentScale * _dragOrigX
+                        // (dnd.js:468), so rescaling about the parent's origin
+                        // needs no second reading of parentScale.
+                        const [parentX, parentY] =
+                            parent.get_transformed_position();
+                        logTime('restore location rescaled', {s});
+                        return [
+                            parentX + (x - parentX) * s,
+                            parentY + (y - parentY) * s,
+                            scale * s,
+                        ];
                     };
-                    // FIXME downstream: the endpoint is only half of the
-                    // snap-back. _cancelDrag eases for SNAP_BACK_ANIMATION_TIME
-                    // (dnd.js:611), and when that ease stops
-                    // _onAnimationComplete (dnd.js:518) reparents the clone into
-                    // _dragOrigParent and clears its fixed position. From there
-                    // WorkspaceLayout owns it, and it allocates previews rather
-                    // than transforming a container (workspace.js:694-769) - so
-                    // a snap-back ending before our zoom-in hands the clone to a
-                    // parent still in motion, and it drops onto the slot the
-                    // zoom-in has reached instead of the endpoint it was eased
-                    // to.
-                    //
-                    // Both eases use EASE_OUT_CUBIC and are created in the same
-                    // frame, so equal durations put the handoff on the value the
-                    // ease already reached. Ideal upstream fix: let the drag
-                    // origin own the snap-back - endpoint and clock - which is
-                    // the same gap _getRestoreLocation above works around.
-                    this._origAnimateDragEnd = draggable._animateDragEnd;
-                    draggable._animateDragEnd = function (eventTime, params) {
-                        // _spatialEngaged is already false when the drop landed
-                        // inside ZOOM_OUT_HOLD_DELAY: _onDragEnd cleared it and
-                        // there is no zoom-in to wait for. The duration test
-                        // leaves the restoreOnSuccess path alone - it reaches
-                        // here too, on REVERT_ANIMATION_TIME (dnd.js:489).
-                        if (self._spatialEngaged &&
-                            params.duration === DND.SNAP_BACK_ANIMATION_TIME) {
-                            logTime('snap-back retimed', {
-                                duration: ZOOM_IN_DURATION,
-                            });
-                            params = {...params, duration: ZOOM_IN_DURATION};
-                        }
-                        return self._origAnimateDragEnd.call(
-                            this, eventTime, params);
-                    };
+
                     const restoreId = draggable.connect('drag-end', () => {
                         self._reattachDetachedSlots();
                         draggable._getRestoreLocation =
                             self._origGetRestoreLocation;
-                        draggable._animateDragEnd = self._origAnimateDragEnd;
                         self._origGetRestoreLocation = null;
-                        self._origAnimateDragEnd = null;
-                        self._fitSingleParent = null;
                         draggable.disconnect(restoreId);
                     });
                 }
