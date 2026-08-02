@@ -827,26 +827,7 @@ export default class SpatialOverviewExtension extends Extension {
                         lm._spatialRefBox = lm._windowSlotsBox.copy();
                         lm._spatialRefLayout = lm._layout;
                         lm._spatialRefSlots = lm._windowSlots;
-
-                        // FIXME downstream: a preview being dragged keeps its
-                        // slot - removeWindow (workspace.js:853) says as much,
-                        // "the window might have been reparented by DND" - so
-                        // vfunc_allocate keeps calling child.allocate() on an
-                        // actor that now lives in Main.uiGroup. The slot box is
-                        // container-local, so it lands somewhere else entirely,
-                        // and the clone only snaps back under the pointer on
-                        // the next motion event, when dnd re-asserts its fixed
-                        // position. Upstream never sees this because nothing
-                        // relayouts a workspace mid-drag; the zoom does it every
-                        // frame. Ideal upstream fix: skip slots whose actor the
-                        // container no longer parents.
                         lm._spatialDetached = [];
-                        for (let i = lm._windowSlots.length - 1; i >= 0; i--) {
-                            if (lm._windowSlots[i][4].get_parent() === container)
-                                continue;
-                            lm._spatialDetached.push([i, lm._windowSlots[i]]);
-                            lm._windowSlots.splice(i, 1);
-                        }
 
                         lm._getWindowSlots = function (containerBox) {
                             if (!self._spatialLayoutActive() ||
@@ -869,6 +850,12 @@ export default class SpatialOverviewExtension extends Extension {
                             return this._spatialRefSlots;
                         };
                     }
+
+                    // Every engage, not only the one that installs the pin: a
+                    // drag begun from a held fit-all finds the pin already
+                    // there, and its clone would keep its slot.
+                    if (lm?._spatialRefSlots)
+                        this._detachDraggedSlots(lm, container);
                 }
             }
         }
@@ -1125,6 +1112,24 @@ export default class SpatialOverviewExtension extends Extension {
                     });
             },
         });
+    }
+
+    // FIXME downstream: a preview being dragged keeps its slot - removeWindow
+    // (workspace.js:853) says as much, "the window might have been reparented
+    // by DND" - so vfunc_allocate keeps calling child.allocate() on an actor
+    // that now lives in Main.uiGroup. The slot box is container-local, so it
+    // lands somewhere else entirely, and the clone only snaps back under the
+    // pointer on the next motion event, when dnd re-asserts its fixed position.
+    // Upstream never sees this because nothing relayouts a workspace mid-drag;
+    // the zoom does it every frame.
+    // Ideal upstream fix: skip slots whose actor the container no longer parents.
+    _detachDraggedSlots(lm, container) {
+        for (let i = lm._windowSlots.length - 1; i >= 0; i--) {
+            if (lm._windowSlots[i][4].get_parent() === container)
+                continue;
+            lm._spatialDetached.push([i, lm._windowSlots[i]]);
+            lm._windowSlots.splice(i, 1);
+        }
     }
 
     // Gives back the slots dropped at engagement, once the container owns the
