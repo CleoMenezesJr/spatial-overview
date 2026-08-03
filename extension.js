@@ -380,7 +380,7 @@ export default class SpatialOverviewExtension extends Extension {
             }
 
             // What the gaps did not absorb goes to the ends. vfunc_allocate
-            // steps by wsSize + adjSpacing (workspacesView.js:376-384), so
+            // steps by wsSize + adjSpacing (workspacesView.js:376-386), so
             // this is the row's real extent.
             const margin = Math.max(
                 (avail - (wsSize * n + adjSpacing * (n - 1))) / 2, 0);
@@ -470,7 +470,7 @@ export default class SpatialOverviewExtension extends Extension {
         // FIXME downstream: LayoutStrategy gets the theme's spacing plus the
         // window chrome oversize in screen pixels (workspace.js:478-495) and
         // computeWindowSlots lays them out inside whatever box it is handed
-        // (workspace.js:355,378). workspace.js:70 already admits the spacing
+        // (workspace.js:329,382). workspace.js:70 already admits the spacing
         // "is not scaled, it's constant", so a workspace re-solved at a third
         // of its size still holds the full ~30px between previews. Ideal
         // upstream fix: scale spacing and oversize by the allocation scale
