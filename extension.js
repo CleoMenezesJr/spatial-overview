@@ -242,6 +242,7 @@ export default class SpatialOverviewExtension extends Extension {
         this._sessionModeUpdatedId = 0;
         this._minWorkspacesProto = null;
         this._panelPatched = false;
+        this._clockIndicatorPad = null;
         this._workspaceDotProto = null;
         this._dotBox = null;
         this._dotLayout = null;
@@ -1944,6 +1945,7 @@ export default class SpatialOverviewExtension extends Extension {
                 parent.remove_child(dateMenu.container);
             panel._leftBox.insert_child_at_index(dateMenu.container, 0);
             dateMenu.add_style_class_name('spatial-clock-left');
+            this._detachClockIndicatorPad(dateMenu);
         }
 
         if (activities?.container) {
@@ -1984,6 +1986,7 @@ export default class SpatialOverviewExtension extends Extension {
                 leftBox.insert_child_at_index(dateMenu.container, 0);
             }
             dateMenu.add_style_class_name('spatial-clock-left');
+            this._detachClockIndicatorPad(dateMenu);
         }
 
         if (activities?.container) {
@@ -2013,6 +2016,7 @@ export default class SpatialOverviewExtension extends Extension {
         const activities = panel?.statusArea.activities;
 
         if (dateMenu?.container) {
+            this._reattachClockIndicatorPad(dateMenu);
             const parent = dateMenu.container.get_parent();
             if (parent)
                 parent.remove_child(dateMenu.container);
@@ -2036,6 +2040,49 @@ export default class SpatialOverviewExtension extends Extension {
 
         this._panelPatched = false;
         logTime('_restorePanelLayout: clock -> center, activities -> left');
+    }
+
+    // FIXME downstream: DateMenuButton balances the messages indicator with an
+    // empty St.Widget (dateMenu.js:871-883). The pad copies the indicator's
+    // size and visibility and goes into .clock-display-box on the side away
+    // from it, so the dot appearing adds the same width to both ends and the
+    // .clock label does not slide. Centered - where upstream puts the clock -
+    // that is the whole point of the pad.
+    //
+    // _patchPanelLayout docks the clock in _leftBox, which Panel allocates
+    // against the start edge of the screen (panel.js:518-523, mirrored under
+    // RTL). There the pad has nothing left to balance: it sits between the
+    // screen edge and the pill, and every notification pushes the pill inward
+    // by the dot's width plus the box's 2px spacing until the dot clears.
+    // Dropping the pad leaves the pill anchored and lets the box grow inward,
+    // on the indicator's side. Which side that is follows the text direction,
+    // so the pad is found by elimination rather than by child index.
+    //
+    // Ideal upstream fix: tie the pad to the clock actually being centered.
+    _detachClockIndicatorPad(dateMenu) {
+        if (this._clockIndicatorPad)
+            return;
+
+        const box = dateMenu?._clockDisplay?.get_parent();
+        const pad = box?.get_children().find(child =>
+            child !== dateMenu._clockDisplay && child !== dateMenu._indicator);
+        if (!pad)
+            return;
+
+        box.remove_child(pad);
+        this._clockIndicatorPad = pad;
+        logTime('_detachClockIndicatorPad: clock indicator pad removed');
+    }
+
+    _reattachClockIndicatorPad(dateMenu) {
+        const pad = this._clockIndicatorPad;
+        this._clockIndicatorPad = null;
+        if (!pad || pad.get_parent())
+            return;
+
+        // Index 0 is where _init put it; the pad keeps its size constraint and
+        // visibility binding across the detach, so re-inserting is enough.
+        dateMenu?._clockDisplay?.get_parent()?.insert_child_at_index(pad, 0);
     }
 
     _getControls() {
