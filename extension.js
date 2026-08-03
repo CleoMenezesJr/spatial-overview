@@ -243,6 +243,11 @@ export default class SpatialOverviewExtension extends Extension {
         this._minWorkspacesProto = null;
         this._panelPatched = false;
         this._workspaceDotProto = null;
+        this._dotBox = null;
+        this._dotLayout = null;
+        this._dotOrigSpacing = 0;
+        this._dotHalfSpacing = 0;
+        this._dotStyleChangedId = 0;
         this._hotCornerPatched = false;
 
         this._patchPanelLayout();
@@ -1778,7 +1783,8 @@ export default class SpatialOverviewExtension extends Extension {
     // notify::scale-x, so layout and paint share one source of truth. That
     // also drops the set_width dance below.
     _patchWorkspaceDots() {
-        const dot = this._getWorkspaceIndicators()?.get_first_child();
+        const box = this._getWorkspaceIndicators();
+        const dot = box?.get_first_child();
         if (!dot)
             return;
 
@@ -1788,6 +1794,37 @@ export default class SpatialOverviewExtension extends Extension {
 
         proto._spatialOrigScaleIn = proto.scaleIn;
         proto._spatialOrigScaleOutAndDestroy = proto.scaleOutAndDestroy;
+
+        // The gap between dots is the box's, and one spacing serves every gap,
+        // so nothing on a dying dot can shrink its own - Clutter clamps margins
+        // at >= 0. Half on each child leaves every gap the same width (half +
+        // half) and makes it a per-dot property, which syncWidth then drives
+        // from the same scale as the width.
+        //
+        // Read from the theme node, not from the layout manager: we zero the
+        // manager's copy, and St re-applies the CSS one on every style change.
+        const readSpacing = () => box.get_theme_node().get_length('spacing');
+        this._dotBox = box;
+        this._dotHalfSpacing = readSpacing() / 2;
+        this._dotLayout = box.layout_manager;
+        this._dotOrigSpacing = this._dotLayout.spacing;
+        this._dotLayout.spacing = 0;
+
+        const syncMargin = dot => {
+            const margin = this._dotHalfSpacing * dot.scale_x;
+            dot.set({margin_start: margin, margin_end: margin});
+        };
+        // The dots already in the box never run scaleIn, so they get their
+        // margin here; a settled dot is at scale_x 1 and one mid-animation is
+        // wherever its ease has reached.
+        const syncAllMargins = () => box.get_children().forEach(syncMargin);
+        syncAllMargins();
+
+        this._dotStyleChangedId = box.connect('style-changed', () => {
+            this._dotHalfSpacing = readSpacing() / 2;
+            this._dotLayout.spacing = 0;
+            syncAllMargins();
+        });
 
         // Re-derived every frame rather than pinned once: _recalculateDots
         // calls scaleIn/scaleOutAndDestroy before _updateExpansion
@@ -1799,6 +1836,7 @@ export default class SpatialOverviewExtension extends Extension {
             dot.set_width(-1);
             const [, natWidth] = dot.get_preferred_width(-1);
             dot.set_width(Math.round(natWidth * dot.scale_x));
+            syncMargin(dot);
         };
         const trackWidth = dot =>
             dot.connect('notify::scale-x', () => syncWidth(dot));
@@ -1822,17 +1860,9 @@ export default class SpatialOverviewExtension extends Extension {
         // EASE_IN_CUBIC, not upstream's EASE_OUT_CUBIC. The removal is the
         // reversal of scaleIn, so it wants the mirrored curve; sharing
         // EASE_OUT_CUBIC front-loads a shrink instead. Measured with upstream's
-        // curve: width fell 8px -> 1px inside the first 300ms, held ~0 for the
-        // remaining 200ms, and only then did destroy() release the row's 5px
-        // BoxLayout spacing - motion, stall, isolated jump.
-        //
-        // That 5px belongs to the box, not the dot, so no per-child property
-        // can animate it away (Clutter clamps margins at >= 0). scaleIn hides
-        // it by spending it at t=0, under the growth that follows. Mirroring
-        // the curve buys the same cover on the way out: the dot now holds its
-        // width and collapses into the final frames, so the spacing is
-        // reclaimed while the row is moving fastest rather than after it
-        // stopped.
+        // curve: width fell 8px -> 1px inside the first 300ms and held ~0 for
+        // the remaining 200ms - motion, then a stall the eye reads as the row
+        // having finished early.
         proto.scaleOutAndDestroy = function () {
             this._destroying = true;
             trackWidth(this);
@@ -1859,8 +1889,19 @@ export default class SpatialOverviewExtension extends Extension {
         delete proto._spatialOrigScaleIn;
         delete proto._spatialOrigScaleOutAndDestroy;
 
+        if (this._dotStyleChangedId) {
+            this._dotBox.disconnect(this._dotStyleChangedId);
+            this._dotStyleChangedId = 0;
+        }
+        // The layout manager is the shell's own and outlives us.
+        if (this._dotLayout) {
+            this._dotLayout.spacing = this._dotOrigSpacing;
+            this._dotLayout = null;
+        }
+        this._dotBox = null;
+
         for (const dot of this._getWorkspaceIndicators()?.get_children() ?? [])
-            dot.set_width(-1);
+            dot.set({width: -1, margin_start: 0, margin_end: 0});
 
         this._workspaceDotProto = null;
         logTime('_restoreWorkspaceDots');
