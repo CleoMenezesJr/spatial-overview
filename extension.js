@@ -43,9 +43,11 @@ const WORKSPACE_ACTIVE_SCALE = 1.06;
 const WORKSPACE_CUT_SIZE = 10; // workspaceThumbnail.js:27
 const MIN_WORKSPACES = 3;
 const WORKSPACE_DOT_DURATION = 500; // panel.js:114,125
-// Multiplies the barrier size layout.js passes in (panelBox.height), so the
-// centered hot zone scales with the panel instead of pinning a pixel count.
-const HOT_CORNER_WIDTH_FACTOR = 5;
+// Fraction of the monitor the centered hot zone spans. The size layout.js
+// passes in (panelBox.height) no longer sets the width, only whether there is
+// a barrier at all: HotCorner._onDestroy tears it down by calling
+// setBarrierSize(0) (layout.js:1238-1239).
+const HOT_EDGE_WIDTH_FRACTION = 1 / 3;
 const PLACEHOLDER_WIDTH = 24;
 
 const ZoomOutView = GObject.registerClass({
@@ -1818,7 +1820,7 @@ export default class SpatialOverviewExtension extends Extension {
             if (size <= 0)
                 return;
 
-            const width = size * HOT_CORNER_WIDTH_FACTOR;
+            const width = Math.round(this._monitor.width * HOT_EDGE_WIDTH_FRACTION);
             const centerX = Math.round(this._monitor.x + this._monitor.width / 2);
             const x = centerX - Math.round(width / 2);
 
