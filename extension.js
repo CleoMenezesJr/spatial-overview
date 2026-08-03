@@ -16,6 +16,7 @@ import {FitMode, WorkspacesView} from 'resource:///org/gnome/shell/ui/workspaces
 import {ControlsState} from 'resource:///org/gnome/shell/ui/overviewControls.js';
 import {HotCorner} from 'resource:///org/gnome/shell/ui/layout.js';
 import {WindowPreview} from 'resource:///org/gnome/shell/ui/windowPreview.js';
+import {WorkspaceLayout} from 'resource:///org/gnome/shell/ui/workspace.js';
 
 const TAG = '[SPATIAL-WS]';
 const DEBUG = GLib.getenv('SPATIAL_WS_DEBUG') !== null;
@@ -30,6 +31,10 @@ const ZOOM_IN_ACTIVATE_DURATION = 200;
 const ZOOM_OUT_HOLD_DELAY = 150;
 const BACKDROP_OPACITY = 180;
 const MIN_WS_SCALE = 0.18;
+// Gap between fit-all workspaces, as a fraction of a workspace's own size.
+// Upstream's ALL-mode spacing is a flat WORKSPACE_MIN_SPACING (24px,
+// workspacesView.js:22,224) that does not follow the shrinking workspaces.
+const WORKSPACE_GAP_RATIO = 0.006;
 const WORKSPACE_CUT_SIZE = 10; // workspaceThumbnail.js:27
 const MIN_WORKSPACES = 3;
 const WORKSPACE_DOT_DURATION = 500; // panel.js:114,125
@@ -317,17 +322,23 @@ export default class SpatialOverviewExtension extends Extension {
         const self = this;
 
         // Shared helper: computes scale + adjusted spacing for FitMode.ALL.
-        // Returns {scale, wsSize, adjSpacing} where wsSize is the workspace
-        // width (horizontal) or height (vertical).
+        // Returns {scale, wsSize, adjSpacing, margin} where wsSize is the
+        // workspace width (horizontal) or height (vertical), and margin is
+        // the offset that centers the row.
         const _computeFitAll = (avail, n, portholeSize, spacing) => {
-            // idealScale: what upstream would compute (fill-all-minus-spacing)
-            const idealScale = (avail - spacing * (n + 1)) / n / portholeSize;
+            // idealScale: the largest scale whose workspaces plus their own
+            // proportional gaps still fit, from
+            // avail = n * wsSize + (n + 1) * WORKSPACE_GAP_RATIO * wsSize.
+            // Upstream instead subtracts a flat spacing (24px at the ALL-mode
+            // clamp), which stays put while the workspaces shrink.
+            const idealScale =
+                avail / (portholeSize * (n + WORKSPACE_GAP_RATIO * (n + 1)));
 
             // With proportional scaling, we want workspaces to shrink
-            // gracefully. Use SPRING_FACTOR to transition from idealScale
-            // toward MIN_WS_SCALE as n grows, but never exceed idealScale
-            // (so few-workspaces layout is preserved) and never go below
-            // MIN_WS_SCALE unless even spacing=0 can't fit them.
+            // gracefully: transition from idealScale toward MIN_WS_SCALE as n
+            // grows, but never exceed idealScale (so few-workspaces layout is
+            // preserved) and never go below MIN_WS_SCALE unless the row cannot
+            // hold them at that size.
             let scale = Math.min(idealScale, 1.0);
 
             // Spring toward MIN_WS_SCALE: blend idealScale with MIN_WS_SCALE
@@ -341,25 +352,35 @@ export default class SpatialOverviewExtension extends Extension {
             }
             scale = Math.max(scale, MIN_WS_SCALE);
 
-            let wsSize = Math.round(portholeSize * scale);
+            // Hard floor: past ~6 workspaces MIN_WS_SCALE asks for more room
+            // than the row has, and idealScale is by construction the largest
+            // scale that still fits with its gaps. Filling the row edge to
+            // edge instead would trade the whole gap budget for under 1% of
+            // size, and read as one wide workspace rather than several.
+            scale = Math.min(scale, idealScale);
 
-            // Hard floor: if wsSize * n > avail even with spacing=0,
-            // MUST shrink below MIN_WS_SCALE to fit.
-            if (wsSize * n > avail) {
-                scale = avail / n / portholeSize;
-                wsSize = Math.round(portholeSize * scale);
-            }
+            const wsSize = Math.round(portholeSize * scale);
 
-            // Recalculate spacing to absorb leftover space (centered).
+            // Spacing absorbs leftover space, but only up to its share of the
+            // workspace it separates. Without the cap every pixel the scale
+            // caps (at 1.0), springs or floors away comes back as gap, so the
+            // emptier the row the wider its holes.
             let adjSpacing;
             if (n > 1) {
                 const leftover = avail - wsSize * n;
-                adjSpacing = Math.max(leftover / (n + 1), 0);
+                adjSpacing = Math.min(Math.max(leftover / (n + 1), 0),
+                    WORKSPACE_GAP_RATIO * wsSize);
             } else {
                 adjSpacing = spacing;
             }
 
-            return {scale, wsSize, adjSpacing};
+            // What the gaps did not absorb goes to the ends. vfunc_allocate
+            // steps by wsSize + adjSpacing (workspacesView.js:376-384), so
+            // this is the row's real extent.
+            const margin = Math.max(
+                (avail - (wsSize * n + adjSpacing * (n - 1))) / 2, 0);
+
+            return {scale, wsSize, adjSpacing, margin};
         };
 
         proto._getSpacing = function (box, fitMode, vertical) {
@@ -400,26 +421,31 @@ export default class SpatialOverviewExtension extends Extension {
             const portholeW = workarea?.width ?? width;
             const portholeH = workarea?.height ?? height;
 
+            let gap = 0;
             if (vertical) {
-                const {wsSize: wsH, adjSpacing} = _computeFitAll(
+                const {wsSize: wsH, adjSpacing, margin} = _computeFitAll(
                     height, nWorkspaces, portholeH, spacing);
+                gap = adjSpacing;
+                y1 = margin;
                 const [, wsW] = workspace.get_preferred_width(wsH);
-                y1 = adjSpacing;
                 if (wsW > width) {
                     const [, realH] = workspace.get_preferred_height(width);
-                    y1 += Math.max(
-                        (height - adjSpacing * 2 - realH * nWorkspaces) / 2, 0);
+                    y1 = Math.max(
+                        (height - (realH * nWorkspaces +
+                            adjSpacing * (nWorkspaces - 1))) / 2, 0);
                 }
                 fitAllBox.set_size(width, wsH);
             } else {
-                const {wsSize: wsW, adjSpacing} = _computeFitAll(
+                const {wsSize: wsW, adjSpacing, margin} = _computeFitAll(
                     width, nWorkspaces, portholeW, spacing);
+                gap = adjSpacing;
+                x1 = margin;
                 const [, wsH] = workspace.get_preferred_height(wsW);
-                x1 = adjSpacing;
                 if (wsH > height) {
                     const [, realW] = workspace.get_preferred_width(height);
-                    x1 += Math.max(
-                        (width - adjSpacing * 2 - realW * nWorkspaces) / 2, 0);
+                    x1 = Math.max(
+                        (width - (realW * nWorkspaces +
+                            adjSpacing * (nWorkspaces - 1))) / 2, 0);
                 }
                 fitAllBox.set_size(wsW, height);
             }
@@ -429,11 +455,55 @@ export default class SpatialOverviewExtension extends Extension {
             logTime('fitAllLayout', JSON.stringify({
                 n: nWorkspaces,
                 scale: (fitAllBox.get_size()[0] / portholeW).toFixed(3),
-                wsW: fitAllBox.get_size()[0], spacing, portholeW,
+                wsW: fitAllBox.get_size()[0], gap: Math.round(gap),
+                x1: Math.round(x1), portholeW,
             }));
 
             return fitAllBox;
         };
+
+        // FIXME downstream: LayoutStrategy gets the theme's spacing plus the
+        // window chrome oversize in screen pixels (workspace.js:478-495) and
+        // computeWindowSlots lays them out inside whatever box it is handed
+        // (workspace.js:355,378). workspace.js:70 already admits the spacing
+        // "is not scaled, it's constant", so a workspace re-solved at a third
+        // of its size still holds the full ~30px between previews. Ideal
+        // upstream fix: scale spacing and oversize by the allocation scale
+        // the layout is being asked to fill.
+        //
+        // This covers the re-solved path only. While the per-instance pin
+        // installed by _engageSpatialLayout holds, fit-all is the
+        // FitMode.SINGLE answer scaled by slotsScale, so its gaps already
+        // shrink with the workspace; the pin drops itself when a window comes
+        // or goes and hands the box back to upstream, which is where the
+        // constant spacing shows up.
+        //
+        // Only the slot pass is scaled. _createBestLayout picks the rows and
+        // columns against the whole workarea and caches them until a window
+        // comes or goes, so scaling there would let fit-all settle on a
+        // different grid than the overview's and reshuffle the previews on
+        // every zoom.
+        this._origGetWindowSlots = WorkspaceLayout.prototype._getWindowSlots;
+        const origGetWindowSlots = this._origGetWindowSlots;
+        WorkspaceLayout.prototype._getWindowSlots = function (containerBox) {
+            if (!self._spatialEngaged || !this._layoutStrategy || !this._workarea)
+                return origGetWindowSlots.call(this, containerBox);
+
+            const strategy = this._layoutStrategy;
+            const scale = Math.min(
+                containerBox.get_width() / this._workarea.width, 1);
+            const rowSpacing = strategy._rowSpacing;
+            const colSpacing = strategy._columnSpacing;
+            strategy._rowSpacing = rowSpacing * scale;
+            strategy._columnSpacing = colSpacing * scale;
+            try {
+                return origGetWindowSlots.call(this, containerBox);
+            } finally {
+                strategy._rowSpacing = rowSpacing;
+                strategy._columnSpacing = colSpacing;
+            }
+        };
+
         this._fitAllPatched = true;
     }
 
@@ -445,8 +515,11 @@ export default class SpatialOverviewExtension extends Extension {
             proto._getFirstFitAllWorkspaceBox = this._origGetFirstFitAllWorkspaceBox;
         if (this._origGetSpacing)
             proto._getSpacing = this._origGetSpacing;
+        if (this._origGetWindowSlots)
+            WorkspaceLayout.prototype._getWindowSlots = this._origGetWindowSlots;
         this._origGetFirstFitAllWorkspaceBox = null;
         this._origGetSpacing = null;
+        this._origGetWindowSlots = null;
         this._fitAllPatched = false;
     }
 
@@ -704,16 +777,7 @@ export default class SpatialOverviewExtension extends Extension {
             // scaled workspace rather than a re-solved one.
             for (const view of ws._workspacesViews ?? []) {
                 for (const w of view._workspaces ?? []) {
-                    if (w._origClip === undefined) {
-                        w._origClip = w.clip_to_allocation;
-                        w.clip_to_allocation = true;
-                    }
                     const container = w._container;
-                    if (container && container._origClip === undefined) {
-                        container._origClip = container.clip_to_allocation;
-                        container.clip_to_allocation = true;
-                    }
-
                     const lm = container?.layout_manager;
                     if (lm && lm._origGetWindowSlots === undefined) {
                         // Upstream already caches this pair for the geometry it
@@ -1626,15 +1690,7 @@ export default class SpatialOverviewExtension extends Extension {
                 view._updateWorkspacesState();
             }
             for (const w of view._workspaces ?? []) {
-                if (w._origClip !== undefined) {
-                    w.clip_to_allocation = w._origClip;
-                    w._origClip = undefined;
-                }
                 const container = w._container;
-                if (container && container._origClip !== undefined) {
-                    container.clip_to_allocation = container._origClip;
-                    container._origClip = undefined;
-                }
                 const lm = container?.layout_manager;
                 if (lm && lm._origGetWindowSlots !== undefined) {
                     lm._getWindowSlots = lm._origGetWindowSlots;
