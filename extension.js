@@ -578,6 +578,7 @@ export default class SpatialOverviewExtension extends Extension {
         this._disconnectFitModeNotify();
         this._removeRestoreIdle();
         this._removeEngageTimeout();
+        this._cancelAllocationWait();
         this._spatialEngaged = false;
         this._restoreWorkspacesState();
         this._restorePreviewActivate();
@@ -619,19 +620,22 @@ export default class SpatialOverviewExtension extends Extension {
                     this._activeDraggable = dragEvent.source._draggable;
                     const draggable = this._activeDraggable;
 
-                    // FIXME downstream: _getRestoreLocation reads the drag
-                    // origin parent's transform at drop time (dnd.js:465-470),
-                    // but _dragOrigX/Y are the clone's allocation inside that
-                    // parent as it stood at gesture recognition (dnd.js:202).
-                    // A drag that starts in FitMode.SINGLE and is dropped in
-                    // FitMode.ALL has the two describing different geometries:
-                    // the container is narrower and WorkspaceLayout multiplies
-                    // every slot by slotsScale (workspace.js:683), so the
-                    // snap-back aims at the fit-single slot and
-                    // _onAnimationComplete then reparents the clone onto the
-                    // fit-all one (dnd.js:519-524). Their difference is the
-                    // jump. A drag begun with fit-all already held has none:
-                    // there the two readings agree.
+                    // FIXME downstream: _getRestoreLocation returns
+                    // parentX + parentScale * _dragOrigX (dnd.js:465-470), but
+                    // _dragOrigX is the clone's allocation inside that parent as
+                    // it stood at gesture recognition (dnd.js:202) - a
+                    // FitMode.SINGLE container coordinate - and parentScale is
+                    // the actor's scale transform, which does not move when the
+                    // container's allocation does. So nothing in that sum
+                    // converts the 962px-wide container the drag began in into
+                    // the 423px-wide one it ends in; WorkspaceLayout does the
+                    // miniaturising through slotsScale (workspace.js:683), where
+                    // dnd cannot see it. The snap-back therefore aims at the
+                    // fit-single slot and _onAnimationComplete reparents the
+                    // clone onto the fit-all one (dnd.js:519-524). Their
+                    // difference is the jump. A drag begun with fit-all already
+                    // held has none: there the two readings agree.
+                    //
                     // Ideal upstream fix: record the restore location as a
                     // fraction of the parent rather than in pixels.
                     const origParentWidth =
@@ -662,11 +666,82 @@ export default class SpatialOverviewExtension extends Extension {
                         ];
                     };
 
+                    // FIXME downstream: the ratio above is only as good as the
+                    // moment it is read, and _animateDragEnd eases to a single
+                    // reading taken at the drop (dnd.js:494-505). Upstream can
+                    // afford that: nothing relayouts a workspace mid-drag. The
+                    // zoom-out does, for 210ms, so a drop taken while it is in
+                    // flight measures a container that is still shrinking -
+                    // 868px one frame in, against the 423px it settles at, so
+                    // the snap-back is aimed at roughly twice its final size.
+                    //
+                    // Wait the row out instead: the snap-back is 250ms and
+                    // starts at the drop, the zoom is 210ms and started before
+                    // it, so the row always settles first and there is always a
+                    // frame where the reading is final. The clone holds where it
+                    // was dropped until then.
+                    //
+                    // Ideal upstream fix: let a drag origin whose geometry is
+                    // animating defer the snap-back until it settles, the way a
+                    // drop target could invalidate a stale hover.
+                    this._origAnimateDragEnd = draggable._animateDragEnd;
+                    const origAnimateDragEnd = this._origAnimateDragEnd;
+                    draggable._animateDragEnd = function (eventTime, params) {
+                        const transition = self._getWsDisplay()
+                            ?._fitModeAdjustment?.get_transition('value');
+                        if (!transition) {
+                            origAnimateDragEnd.call(this, eventTime, params);
+                            return;
+                        }
+
+                        logTime('snap-back deferred until the zoom settles');
+                        // What _animateDragEnd would have set. The drag is
+                        // already on its way back, and a clone destroyed before
+                        // the tween starts still has to reach _finishAnimation
+                        // (dnd.js:236-237) for the draggable to be torn down.
+                        this._animationInProgress = true;
+                        // Not on 'stopped' alone: the value that ends the
+                        // transition only queues the relayout that resolves the
+                        // row (workspacesView.js:99-103), and 'stopped' lands in
+                        // the same frame. get_width() on an actor still owing an
+                        // allocation answers with its preferred width, which for
+                        // WorkspaceLayout is the whole workarea (workspace.js:
+                        // 607-609) - a constant, and the ratio built from it
+                        // read 1.29 no matter when the drop came.
+                        transition.connect('stopped', () => {
+                            self._afterAllocation(this._dragOrigParent, () => {
+                                if (!this._dragActor)
+                                    return;
+                                this._animationInProgress = false;
+
+                                const [x, y, scale] = this._getRestoreLocation();
+                                // _cancelDrag eases to the location it read
+                                // (dnd.js:603-611); _restoreDragActor puts the
+                                // clone there first and eases opacity alone
+                                // (dnd.js:481-491). Both readings are the stale
+                                // one, so replace whichever this call carries.
+                                if ('x' in params) {
+                                    origAnimateDragEnd.call(this, eventTime, {
+                                        ...params,
+                                        x, y, scale_x: scale, scale_y: scale,
+                                    });
+                                } else {
+                                    this._dragActor.set_position(x, y);
+                                    this._dragActor.set_scale(scale, scale);
+                                    origAnimateDragEnd.call(
+                                        this, eventTime, params);
+                                }
+                            });
+                        });
+                    };
+
                     const restoreId = draggable.connect('drag-end', () => {
                         self._reattachDetachedSlots();
                         draggable._getRestoreLocation =
                             self._origGetRestoreLocation;
                         self._origGetRestoreLocation = null;
+                        draggable._animateDragEnd = self._origAnimateDragEnd;
+                        self._origAnimateDragEnd = null;
                         draggable.disconnect(restoreId);
                     });
                 }
@@ -1284,6 +1359,48 @@ export default class SpatialOverviewExtension extends Extension {
                 container.queue_relayout();
             }
         }
+    }
+
+    // Runs the callback once the actor's geometry can be read back, i.e. once
+    // it stops owing an allocation. Callers that only need to know a relayout
+    // was queued have notify::allocation; this is for the ones that need the
+    // answer.
+    _afterAllocation(actor, callback) {
+        this._cancelAllocationWait();
+
+        if (!actor || actor.has_allocation()) {
+            callback();
+            return;
+        }
+
+        const fire = () => {
+            this._cancelAllocationWait();
+            callback();
+        };
+
+        const wait = {actor, allocationId: 0, timeoutId: 0};
+        this._allocationWait = wait;
+        wait.allocationId = actor.connect('notify::allocation', fire);
+        // A relayout that lands on the geometry the actor already had clears
+        // the debt without changing the box, and notify::allocation carries
+        // the change, not the clearing. Waiting on it alone can wait forever.
+        wait.timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 50, () => {
+            wait.timeoutId = 0;
+            fire();
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    _cancelAllocationWait() {
+        const wait = this._allocationWait;
+        if (!wait)
+            return;
+
+        this._allocationWait = null;
+        if (wait.allocationId)
+            wait.actor.disconnect(wait.allocationId);
+        if (wait.timeoutId)
+            GLib.source_remove(wait.timeoutId);
     }
 
     _removeRestoreIdle() {
