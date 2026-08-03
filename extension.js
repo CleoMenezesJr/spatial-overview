@@ -35,6 +35,11 @@ const MIN_WS_SCALE = 0.18;
 // Upstream's ALL-mode spacing is a flat WORKSPACE_MIN_SPACING (24px,
 // workspacesView.js:22,224) that does not follow the shrinking workspaces.
 const WORKSPACE_GAP_RATIO = 0.006;
+// Upstream emphasises the current workspace by shrinking every other one to
+// WORKSPACE_INACTIVE_SCALE (0.94, workspacesView.js:25). Same 6% difference,
+// anchored the other way round: the row sits at 1 and the current one grows,
+// so the emphasis spends the gap instead of leaving a hole beside every panel.
+const WORKSPACE_ACTIVE_SCALE = 1.06;
 const WORKSPACE_CUT_SIZE = 10; // workspaceThumbnail.js:27
 const MIN_WORKSPACES = 3;
 const WORKSPACE_DOT_DURATION = 500; // panel.js:114,125
@@ -741,6 +746,26 @@ export default class SpatialOverviewExtension extends Extension {
             // desktop mode (overflowing the shrunken Workspace actor). We
             // force stateAdjustment.value = 1 so WindowPreviews rearrange
             // (overview layout) to fit the Workspace rect in FitMode.ALL.
+            //
+            // The scale two lines below it (workspacesView.js:263) needs the
+            // same treatment and does not get it: every workspace further than
+            // one step from the scroll position is drawn at
+            // WORKSPACE_INACTIVE_SCALE, shrunk about its own centre. That is
+            // emphasis for FitMode.SINGLE, where only the neighbours peek in
+            // at the edges. In FitMode.ALL the whole row is on screen, so the
+            // 6% each panel gives up becomes gap - 3% on its left, 3% on its
+            // right, and 6% of a panel between two inactive neighbours, which
+            // dwarfs the spacing the layout actually asks for.
+            //
+            // Keep the emphasis, drop the hole: put the row at 1 and grow the
+            // current workspace instead, reusing upstream's own scaleProgress
+            // so the accent still hands over smoothly as the scroll position
+            // moves. What it grows into is the gap, not reserved space, so it
+            // has to be drawn above its neighbours.
+            //
+            // Ideal upstream fix: make the emphasis grow the current workspace
+            // rather than shrink the rest, so a row that shows every workspace
+            // at once does not have to reserve the difference beside each one.
             for (const view of ws._workspacesViews ?? []) {
                 if (!view._workspaces || view._origUpdateWorkspacesState)
                     continue;
@@ -748,10 +773,31 @@ export default class SpatialOverviewExtension extends Extension {
                 const origFn = view._origUpdateWorkspacesState;
                 view._updateWorkspacesState = function () {
                     origFn?.call(this);
-                    if (self._spatialLayoutActive()) {
-                        for (const w of this._workspaces ?? [])
-                            w.stateAdjustment.value = 1;
-                    }
+                    if (!self._spatialLayoutActive())
+                        return;
+
+                    const adj = this._scrollAdjustment;
+                    let top = null;
+                    let topProgress = 0;
+                    (this._workspaces ?? []).forEach((w, index) => {
+                        w.stateAdjustment.value = 1;
+
+                        const progress =
+                            1 - Math.clamp(Math.abs(adj.value - index), 0, 1);
+                        const scale =
+                            1 + (WORKSPACE_ACTIVE_SCALE - 1) * progress;
+                        w.set_scale(scale, scale);
+
+                        if (progress > topProgress) {
+                            topProgress = progress;
+                            top = w;
+                        }
+                    });
+                    // This runs on every frame of the zoom; restacking an
+                    // actor that is already on top still rebuilds the child
+                    // list and queues a redraw.
+                    if (top && this.get_last_child() !== top)
+                        this.set_child_above_sibling(top, null);
                 };
                 view._updateWorkspacesState();
             }
@@ -1304,6 +1350,21 @@ export default class SpatialOverviewExtension extends Extension {
         const spacing = rects.length > 1
             ? Math.max(0, rects[1].x - (rects[0].x + rects[0].w))
             : 0;
+
+        if (DEBUG) {
+            const key = rects.map(r => `${r.x}:${r.w}`).join(',');
+            if (this._rectProbeKey !== key) {
+                this._rectProbeKey = key;
+                logTime('wsRects', JSON.stringify({
+                    n: rects.length, spacing,
+                    panel: rects[0] ? [rects[0].w, rects[0].h] : null,
+                    x: rects.map(r => r.x),
+                    gaps: rects.slice(1).map(
+                        (r, k) => r.x - (rects[k].x + rects[k].w)),
+                }));
+            }
+        }
+
         return {rects, monitor: mon, spacing};
     }
 
@@ -1687,6 +1748,11 @@ export default class SpatialOverviewExtension extends Extension {
             if (view._origUpdateWorkspacesState) {
                 view._updateWorkspacesState = view._origUpdateWorkspacesState;
                 view._origUpdateWorkspacesState = null;
+                // The accent raised one workspace above its siblings; put the
+                // row back in workspace order, the way upstream restacks it
+                // after a reorder (workspacesView.js:119-122).
+                view._workspaces?.forEach(
+                    (w, i) => view.set_child_at_index(w, i));
                 view._updateWorkspacesState();
             }
             for (const w of view._workspaces ?? []) {
