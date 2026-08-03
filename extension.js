@@ -779,6 +779,11 @@ export default class SpatialOverviewExtension extends Extension {
                         return;
 
                     const adj = this._scrollAdjustment;
+                    // The accent belongs to the row, so it has to arrive and
+                    // leave with it. Weighting by fitMode is upstream's own
+                    // idiom for the same reason one line up
+                    // (workspacesView.js:250).
+                    const fitMode = this._fitModeAdjustment.value;
                     let top = null;
                     let topProgress = 0;
                     (this._workspaces ?? []).forEach((w, index) => {
@@ -786,8 +791,13 @@ export default class SpatialOverviewExtension extends Extension {
 
                         const progress =
                             1 - Math.clamp(Math.abs(adj.value - index), 0, 1);
-                        const scale =
+                        const accent =
                             1 + (WORKSPACE_ACTIVE_SCALE - 1) * progress;
+                        // origFn left upstream's own answer on the actor, so
+                        // blending out of it is what makes FitMode.SINGLE agree
+                        // with upstream to the pixel - and handing the state
+                        // back at the end of a zoom-in changes nothing on screen.
+                        const scale = w.scale_x + (accent - w.scale_x) * fitMode;
                         w.set_scale(scale, scale);
 
                         if (progress > topProgress) {
