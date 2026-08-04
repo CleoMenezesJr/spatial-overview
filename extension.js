@@ -2093,6 +2093,22 @@ export default class SpatialOverviewExtension extends Extension {
         const trackWidth = dot =>
             dot.connect('notify::scale-x', () => syncWidth(dot));
 
+        // FIXME downstream: a reparent drops the actor's in-flight
+        // transitions. Measured in the nested shell, remove_child +
+        // insert_child_at_index 60ms into a 500ms ease: get_transition
+        // ('scale-x') is null in the same turn, 'stopped' arrives with
+        // finished false, and the scale holds the value it was cut at for the
+        // rest of the session.
+        //
+        // _addToPanelBox reparents the Activities container on every
+        // sessionMode change (panel.js:693-700), _reapplyPanelLayout again
+        // after it. Measured across one such reparent, upstream's scaleIn
+        // (panel.js:107-131) left a dot at scale 0.27 and 8px wide, and its
+        // scaleOutAndDestroy never reached onComplete: the dot stayed a child
+        // with _destroying set, which _getActiveIndicators skips and
+        // _updateExpansion still counts by index.
+        //
+        // Ideal upstream fix: these two handlers.
         proto.scaleIn = function () {
             this.set({scale_x: 0, scale_y: 0});
             const id = trackWidth(this);
@@ -2102,8 +2118,12 @@ export default class SpatialOverviewExtension extends Extension {
                 mode: Clutter.AnimationMode.EASE_OUT_CUBIC,
                 scale_x: 1.0,
                 scale_y: 1.0,
-                onStopped: () => {
+                // scaleOutAndDestroy sets _destroying before it eases, so the
+                // ease it cuts here is not undone.
+                onStopped: finished => {
                     this.disconnect(id);
+                    if (!finished && !this._destroying)
+                        this.set({scale_x: 1, scale_y: 1});
                     this.set_width(-1);
                 },
             });
@@ -2123,7 +2143,10 @@ export default class SpatialOverviewExtension extends Extension {
                 mode: Clutter.AnimationMode.EASE_IN_CUBIC,
                 scale_x: 0.0,
                 scale_y: 0.0,
-                onComplete: () => this.destroy(),
+                // onStopped, not upstream's onComplete: _getActiveIndicators
+                // hands out only dots without _destroying, so nothing else
+                // eases this one.
+                onStopped: () => this.destroy(),
             });
         };
 
