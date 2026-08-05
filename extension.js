@@ -2066,10 +2066,37 @@ export default class SpatialOverviewExtension extends Extension {
             const margin = this._dotHalfSpacing * dot.scale_x;
             dot.set({margin_start: margin, margin_end: margin});
         };
-        // The dots already in the box never run scaleIn, so they get their
-        // margin here; a settled dot is at scale_x 1 and one mid-animation is
-        // wherever its ease has reached.
+        // WorkspaceIndicators builds its first dots straight in the
+        // constructor, without scaleIn (panel.js:149-150), so nothing else
+        // ever hands them a margin.
         const syncAllMargins = () => box.get_children().forEach(syncMargin);
+
+        // FIXME downstream: a dot the shell eased while these handlers were
+        // absent stays wherever the ease stopped. Upstream's scaleIn
+        // (panel.js:107-119) has no onStopped, so an ease a reparent cuts
+        // holds the scale it reached; upstream's scaleOutAndDestroy
+        // (panel.js:121-131) destroys from onComplete, which a cut ease never
+        // reaches. The dot stays a child either way and nothing moves it
+        // again.
+        //
+        // Measured on the running session: a dot sat at scale_x 0 with no
+        // transition and _destroying false - invisible, still holding its 8px
+        // slot - and its margins were 0, the value syncMargin computes from
+        // scale 0, so it was already stranded when this adopted the row. The
+        // window is any stretch with the shell alive and these handlers off:
+        // metadata.json declares no session-modes, so extensionSystem.js:393
+        // defaults us to ['user'] and the lock screen disables us mid-ease.
+        //
+        // Ideal upstream fix: onStopped instead of onComplete in both, so a
+        // cut ease settles where its own handler decides.
+        for (const dot of box.get_children()) {
+            if (dot.get_transition('scale-x'))
+                continue;
+            if (dot._destroying)
+                dot.destroy();
+            else if (dot.scale_x !== 1)
+                dot.set({scale_x: 1, scale_y: 1});
+        }
         syncAllMargins();
 
         this._dotStyleChangedId = box.connect('style-changed', () => {
