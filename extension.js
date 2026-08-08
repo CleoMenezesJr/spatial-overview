@@ -273,6 +273,7 @@ export default class SpatialOverviewExtension extends Extension {
         this._sessionModeUpdatedId = 0;
         this._minWorkspacesProto = null;
         this._panelPatched = false;
+        this._activitiesCheckedPatched = false;
         this._clockIndicatorPad = null;
         this._workspaceDotProto = null;
         this._workspaceIndicatorsProto = null;
@@ -284,6 +285,7 @@ export default class SpatialOverviewExtension extends Extension {
         this._hotCornerPatched = false;
 
         this._patchPanelLayout();
+        this._patchActivitiesChecked();
         this._patchWorkspaceDots();
         this._patchWorkspaceDotWidth();
         this._patchHotCorner();
@@ -605,6 +607,7 @@ export default class SpatialOverviewExtension extends Extension {
         this._restorePreviewActivate();
         this._restoreFitAllLayout();
         this._restorePanelLayout();
+        this._restoreActivitiesChecked();
         this._restoreWorkspaceDotWidth();
         this._restoreWorkspaceDots();
         this._restoreHotCorner();
@@ -2415,6 +2418,54 @@ export default class SpatialOverviewExtension extends Extension {
 
         this._panelPatched = false;
         logTime('_restorePanelLayout: clock -> center, activities -> left');
+    }
+
+    // ActivitiesButton keeps a 'checked' pseudo class for as long as the
+    // overview is up (panel.js:211-219), which the theme paints as a filled
+    // pill behind the dots. Upstream that pill sits in the panel's left
+    // corner; _patchPanelLayout centers it, directly above the overview's
+    // search entry - two stacked pills of the same shape (issue #2).
+    //
+    // 'active' on a panel button means its menu is open (panelMenu.js:
+    // 168-172) and this button is built without one (panel.js:200), so
+    // dropping 'checked' leaves the theme painting hover and focus only -
+    // the feedback the issue asks to keep.
+    _patchActivitiesChecked() {
+        const activities = Main.panel?.statusArea?.activities;
+        if (!activities || this._activitiesCheckedPatched)
+            return;
+
+        // connectObject tracks both handlers under the button, and those two
+        // are the only ones ActivitiesButton registers on Main.overview, so
+        // disconnecting by owner takes exactly them.
+        Main.overview.disconnectObject(activities);
+        activities.remove_style_pseudo_class('checked');
+
+        this._activitiesCheckedPatched = true;
+        logTime('_patchActivitiesChecked: overview no longer checks the button');
+    }
+
+    _restoreActivitiesChecked() {
+        if (!this._activitiesCheckedPatched)
+            return;
+        this._activitiesCheckedPatched = false;
+
+        const activities = Main.panel?.statusArea?.activities;
+        if (!activities)
+            return;
+
+        Main.overview.connectObject('showing',
+            () => activities.add_style_pseudo_class('checked'),
+            activities);
+        Main.overview.connectObject('hiding',
+            () => activities.remove_style_pseudo_class('checked'),
+            activities);
+        // The handlers only fire on a transition, and the overview can already
+        // be up when this runs.
+        if (Main.overview.visible)
+            activities.add_style_pseudo_class('checked');
+
+        logTime('_restoreActivitiesChecked');
     }
 
     // FIXME downstream: DateMenuButton balances the messages indicator with an
