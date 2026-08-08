@@ -43,6 +43,25 @@ const WORKSPACE_ACTIVE_SCALE = 1.06;
 const WORKSPACE_CUT_SIZE = 10; // workspaceThumbnail.js:27
 const MIN_WORKSPACES = 3;
 const WORKSPACE_DOT_DURATION = 500; // panel.js:114,125
+// FIXME downstream: the active pill is one WorkspaceDot widened by
+// widthMultiplier (panel.js:91-94), and upstream picks that multiplier in
+// three flat steps - 3.625 up to 2 dots, 3.25 up to 5, 2.75 beyond
+// (panel.js:182-189). The dot is 8px (.workspace-dot min-width 0.5455em,
+// gnome-shell-dark.css:1834-1838), so two workspaces give a 29px pill in a
+// 42px row, and the row only reaches 100px at seven dots.
+//
+// Measured in the mockup on issue #3: a 58px pill against that same 8px dot,
+// i.e. multiplier 7.25, asked to "reach the current pill size when you get to
+// e.g. 7 workspaces". A 0.9 step per dot joins 7.25 to upstream's 2.75 at
+// seven dots, where the row is 100px either way.
+//
+// Ideal upstream fix: this ramp inside _updateExpansion, in place of the
+// steps.
+const WORKSPACE_DOT_WIDTH_MAX = 7.25;
+const WORKSPACE_DOT_WIDTH_MIN = 2.75; // panel.js:188
+const WORKSPACE_DOT_WIDTH_STEP = 0.9;
+// Dots that still get the full width, before the step starts.
+const WORKSPACE_DOT_WIDTH_PLATEAU = 2;
 // Fraction of the monitor the centered hot zone spans. The size layout.js
 // passes in (panelBox.height) no longer sets the width, only whether there is
 // a barrier at all: HotCorner._onDestroy tears it down by calling
@@ -256,6 +275,7 @@ export default class SpatialOverviewExtension extends Extension {
         this._panelPatched = false;
         this._clockIndicatorPad = null;
         this._workspaceDotProto = null;
+        this._workspaceIndicatorsProto = null;
         this._dotBox = null;
         this._dotLayout = null;
         this._dotOrigSpacing = 0;
@@ -265,6 +285,7 @@ export default class SpatialOverviewExtension extends Extension {
 
         this._patchPanelLayout();
         this._patchWorkspaceDots();
+        this._patchWorkspaceDotWidth();
         this._patchHotCorner();
         this._patchPreviewActivate();
         this._patchFitAllLayout();
@@ -584,6 +605,7 @@ export default class SpatialOverviewExtension extends Extension {
         this._restorePreviewActivate();
         this._restoreFitAllLayout();
         this._restorePanelLayout();
+        this._restoreWorkspaceDotWidth();
         this._restoreWorkspaceDots();
         this._restoreHotCorner();
         this._dragActive = false;
@@ -2207,6 +2229,58 @@ export default class SpatialOverviewExtension extends Extension {
 
         this._workspaceDotProto = null;
         logTime('_restoreWorkspaceDots');
+    }
+
+    // The multiplier itself, unlike the width the dot derives from it, is
+    // reachable from an extension: _updateExpansion is a plain prototype
+    // method (panel.js:178-195), not a vfunc frozen into the vtable at
+    // registerClass time like vfunc_get_preferred_width above.
+    _patchWorkspaceDotWidth() {
+        const box = this._getWorkspaceIndicators();
+        if (!box)
+            return;
+
+        const proto = Object.getPrototypeOf(box);
+        if (proto._spatialOrigUpdateExpansion)
+            return;
+
+        proto._spatialOrigUpdateExpansion = proto._updateExpansion;
+        // Upstream's body (panel.js:178-195) apart from the multiplier.
+        proto._updateExpansion = function () {
+            const nIndicators = this._getActiveIndicators().length;
+            const activeWorkspace = this._workspacesAdjustment.value;
+
+            const extraDots =
+                Math.max(nIndicators - WORKSPACE_DOT_WIDTH_PLATEAU, 0);
+            const widthMultiplier = Math.max(
+                WORKSPACE_DOT_WIDTH_MAX - WORKSPACE_DOT_WIDTH_STEP * extraDots,
+                WORKSPACE_DOT_WIDTH_MIN);
+
+            this.get_children().forEach((indicator, index) => {
+                const distance = Math.abs(index - activeWorkspace);
+                indicator.expansion = Math.clamp(1 - distance, 0, 1);
+                indicator.widthMultiplier = widthMultiplier;
+            });
+        };
+
+        this._workspaceIndicatorsProto = proto;
+        // Nothing re-runs _updateExpansion until the adjustment moves: the box
+        // connects it to notify::value and notify::upper only
+        // (panel.js:143-147).
+        box._updateExpansion();
+        logTime('_patchWorkspaceDotWidth: pill width ramps with dot count');
+    }
+
+    _restoreWorkspaceDotWidth() {
+        const proto = this._workspaceIndicatorsProto;
+        if (!proto)
+            return;
+
+        proto._updateExpansion = proto._spatialOrigUpdateExpansion;
+        delete proto._spatialOrigUpdateExpansion;
+        this._workspaceIndicatorsProto = null;
+        this._getWorkspaceIndicators()?._updateExpansion();
+        logTime('_restoreWorkspaceDotWidth');
     }
 
     // FIXME downstream: panel item positions are hardcoded in sessionMode.js
