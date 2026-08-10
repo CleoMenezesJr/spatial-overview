@@ -602,10 +602,21 @@ export default class SpatialOverviewExtension extends Extension {
 
         this._origSyncOverlay = WorkspaceLayout.prototype._syncOverlay;
         const origSyncOverlay = this._origSyncOverlay;
+        // FIXME downstream: overlayEnabled is not a plain flag. Its setter
+        // calls showOverlay() on the spot whenever the pointer is on the
+        // preview or it holds the key focus (windowPreview.js:500-503), so
+        // letting the original answer first and correcting it afterwards puts
+        // the caption and the close button on screen once per pass - and the
+        // _updateWorkspacesState hook runs a pass on every frame of the zoom.
+        //
+        // Ideal upstream fix: let a WorkspaceLayout in FitMode.ALL say that
+        // its previews take no overlay, instead of deriving it from the state
+        // adjustment alone.
         WorkspaceLayout.prototype._syncOverlay = function (preview) {
-            origSyncOverlay.call(this, preview);
             if (self._floatingFitMode() > FitMode.SINGLE)
                 preview.overlayEnabled = false;
+            else
+                origSyncOverlay.call(this, preview);
         };
 
         // FIXME downstream: _doRemoveWindow freezes the layout and thaws it
@@ -1848,8 +1859,23 @@ export default class SpatialOverviewExtension extends Extension {
         // Both are patched to read the zoom, so asking upstream's own
         // question again is what carries the fade - and what hands the answer
         // back whole once the zoom is over.
-        for (const preview of lm?._windows?.keys() ?? [])
+        const fitMode = this._floatingFitMode();
+        for (const preview of lm?._windows?.keys() ?? []) {
             preview._updateIconScale?.();
+
+            // FIXME downstream: hideOverlay clears _overlayShown before the
+            // fade that takes the caption and the close button off, and its
+            // own guard reads that flag (windowPreview.js:359-381). A fade
+            // that never finishes therefore leaves both on screen with the
+            // flag already saying they are down, and no later call reaches
+            // them - measured with fit-all up: both actors visible,
+            // _overlayShown false. Refusing the overlay is not enough; the
+            // two actors have to be answered for, the way the icon is.
+            if (fitMode > FitMode.SINGLE) {
+                preview._title?.hide();
+                preview._closeButton?.hide();
+            }
+        }
         lm?.syncOverlays();
     }
 
