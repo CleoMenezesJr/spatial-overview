@@ -98,12 +98,16 @@ const ZoomOutView = GObject.registerClass({
             upper: 1,
         });
 
+        // Parented by _installBackdrop, not added here. This view is the last
+        // child of overviewGroup because _pickTargetActor walks up from the
+        // actor under the pointer (dnd.js:302), so it only collects
+        // handleDragOver while it is above the workspaces - and a child of it
+        // is painted above them too.
         this._backdrop = new St.Widget({
             style_class: 'zoom-out-backdrop',
             reactive: false,
             opacity: 0,
         });
-        this.add_child(this._backdrop);
 
         // FIXME downstream: replica of the upstream ThumbnailsBox
         // _dropPlaceholder (workspaceThumbnail.js:613). Used to signal
@@ -142,6 +146,14 @@ const ZoomOutView = GObject.registerClass({
     show() {
         logTime('VIEW.show start (zoom-out)');
         this.visible = true;
+        // overviewGroup allocates its children at their own preferred size,
+        // and a St.Widget with no children prefers 0x0. Same monitor this
+        // view's vfunc_get_preferred_width answers with.
+        const mon = Main.layoutManager.monitors[
+            Main.layoutManager.primaryIndex];
+        if (mon)
+            this._backdrop.set_size(mon.width, mon.height);
+        this._backdrop.visible = true;
         this._progressAdj.ease(1, {
             duration: ZOOM_OUT_DURATION,
             mode: Clutter.AnimationMode.EASE_OUT_CUBIC,
@@ -156,6 +168,7 @@ const ZoomOutView = GObject.registerClass({
             onComplete: () => {
                 logTime('VIEW.hide onComplete (zoom-in DONE)');
                 this._backdrop.opacity = 0;
+                this._backdrop.visible = false;
                 this.visible = false;
             },
         });
@@ -169,13 +182,6 @@ const ZoomOutView = GObject.registerClass({
 
     vfunc_allocate(box) {
         this.set_allocation(box);
-
-        const [width, height] = box.get_size();
-
-        const backdropBox = new Clutter.ActorBox();
-        backdropBox.set_origin(0, 0);
-        backdropBox.set_size(width, height);
-        this._backdrop.allocate(backdropBox);
 
         if (this._dropPlaceholder && this._dropPlaceholder.visible &&
             this._dropPlaceholderRect) {
@@ -302,6 +308,7 @@ export default class SpatialOverviewExtension extends Extension {
         this._zoomOutView = new ZoomOutView();
         this._zoomOutView._extension = this;
         Main.layoutManager.overviewGroup.add_child(this._zoomOutView);
+        this._installBackdrop();
 
         this._overrideThumbnailsShouldShow();
 
@@ -336,6 +343,16 @@ export default class SpatialOverviewExtension extends Extension {
             if (this._spatialEngaged)
                 this._leaveFitAll({animate: false});
         });
+    }
+
+    // Index 0: painted before everything the overview draws, so the row is in
+    // front of it. What it still darkens is the wallpaper - a translucent quad
+    // composites over whatever was drawn before it, not only over its own
+    // siblings, and the wallpaper is in global.window_group (layout.js:319-321),
+    // below uiGroup.
+    _installBackdrop() {
+        Main.layoutManager.overviewGroup.insert_child_at_index(
+            this._zoomOutView._backdrop, 0);
     }
 
     // FIXME downstream: Upstream _getFirstFitAllWorkspaceBox divides available
@@ -718,6 +735,8 @@ export default class SpatialOverviewExtension extends Extension {
         this._dragActive = false;
 
         if (this._zoomOutView) {
+            // Not a child of the view, so its destroy does not take it.
+            this._zoomOutView._backdrop.destroy();
             this._zoomOutView.destroy();
             this._zoomOutView = null;
         }
