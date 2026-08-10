@@ -16,7 +16,7 @@ import {FitMode, WorkspacesView} from 'resource:///org/gnome/shell/ui/workspaces
 import {ControlsState} from 'resource:///org/gnome/shell/ui/overviewControls.js';
 import {HotCorner} from 'resource:///org/gnome/shell/ui/layout.js';
 import {WindowPreview} from 'resource:///org/gnome/shell/ui/windowPreview.js';
-import {WorkspaceLayout} from 'resource:///org/gnome/shell/ui/workspace.js';
+import {Workspace, WorkspaceLayout} from 'resource:///org/gnome/shell/ui/workspace.js';
 
 const TAG = '[SPATIAL-WS]';
 const DEBUG = GLib.getenv('SPATIAL_WS_DEBUG') !== null;
@@ -273,6 +273,7 @@ export default class SpatialOverviewExtension extends Extension {
         this._sessionModeUpdatedId = 0;
         this._minWorkspacesProto = null;
         this._panelPatched = false;
+        this._workspaceCollectionBlocked = false;
         this._activitiesCheckedPatched = false;
         this._clockIndicatorPad = null;
         this._workspaceDotProto = null;
@@ -516,7 +517,10 @@ export default class SpatialOverviewExtension extends Extension {
         this._origGetWindowSlots = WorkspaceLayout.prototype._getWindowSlots;
         const origGetWindowSlots = this._origGetWindowSlots;
         WorkspaceLayout.prototype._getWindowSlots = function (containerBox) {
-            if (!self._spatialEngaged || !this._layoutStrategy || !this._workarea)
+            // A foreign strategy places by proportion, not by row and column,
+            // so it has no spacing of ours to scale.
+            if (!self._spatialEngaged || !this._layoutStrategy ||
+                !this._workarea || self._strategyOwnsGeometry(this))
                 return origGetWindowSlots.call(this, containerBox);
 
             const strategy = this._layoutStrategy;
@@ -534,6 +538,86 @@ export default class SpatialOverviewExtension extends Extension {
             }
         };
 
+        // Both of these answer for a preview that may be born, or re-asked,
+        // long after the zoom settled - a window opened while fit-all is held
+        // builds its WindowPreview then, and its constructor calls
+        // _updateIconScale on the spot (windowPreview.js:227). Pushing the
+        // floating chrome from the zoom's own frames reaches neither.
+        this._origUpdateIconScale = WindowPreview.prototype._updateIconScale;
+        const origUpdateIconScale = this._origUpdateIconScale;
+        WindowPreview.prototype._updateIconScale = function () {
+            origUpdateIconScale.call(this);
+            const fitMode = self._floatingFitMode();
+            if (fitMode === FitMode.SINGLE)
+                return;
+            // Upstream's answer for the overview state, faded by the zoom:
+            // it re-runs from here on the next call, so this cannot compound.
+            const scale = this._icon.scale_x * (1 - fitMode);
+            this._icon.set({scale_x: scale, scale_y: scale});
+        };
+
+        // FIXME downstream: the only geometry signal WorkspaceLayout takes is
+        // the MetaWindow's size-changed (workspace.js:801). A window that only
+        // moves never reaches _needsLayout, and nothing else re-reads where it
+        // is - right for the spread, which places windows by its own strategy
+        // and ignores where they really are, and wrong for a layout that draws
+        // them where they really are.
+        //
+        // WindowPreview already emits what is needed: its size-changed fires
+        // on every bounding-box change, move included (windowPreview.js:
+        // 86-98). Nothing in workspace.js listens to it.
+        //
+        // Ideal upstream fix: let WorkspaceLayout follow the preview's
+        // size-changed, so the floating layout is as live as the spread.
+        this._origAddWindow = WorkspaceLayout.prototype.addWindow;
+        const origAddWindow = this._origAddWindow;
+        WorkspaceLayout.prototype.addWindow = function (window, metaWindow) {
+            origAddWindow.call(this, window, metaWindow);
+            if (self._spatialLayoutActive())
+                self._trackFloatingGeometry(this, window);
+        };
+
+        this._origSyncOverlay = WorkspaceLayout.prototype._syncOverlay;
+        const origSyncOverlay = this._origSyncOverlay;
+        WorkspaceLayout.prototype._syncOverlay = function (preview) {
+            origSyncOverlay.call(this, preview);
+            if (self._floatingFitMode() > FitMode.SINGLE)
+                preview.overlayEnabled = false;
+        };
+
+        // FIXME downstream: _doRemoveWindow freezes the layout and thaws it
+        // only once the pointer has held still for 750ms away from the
+        // workspace (workspace.js:1147-1183), because in the spread every
+        // window left behind moves to close the gap and upstream will not do
+        // that under the pointer. While the layout is frozen vfunc_allocate
+        // skips the slot pass entirely (workspace.js:670), so nothing here
+        // re-reads where the windows are.
+        //
+        // Dragging a window to another workspace is the ordinary way to use
+        // fit-all, and it is exactly the gesture that leaves the pointer on
+        // the workspace it just emptied - the freeze can outlast the whole
+        // interaction. There is nothing for it to protect either: the
+        // floating layout draws every window where it really is, so a window
+        // leaving moves none of the others.
+        //
+        // Ideal upstream fix: freeze against the reshuffle, not against the
+        // removal - a layout that does not reflow has nothing to defer.
+        this._origDoRemoveWindow = Workspace.prototype._doRemoveWindow;
+        const origDoRemoveWindow = this._origDoRemoveWindow;
+        Workspace.prototype._doRemoveWindow = function (metaWin) {
+            origDoRemoveWindow.call(this, metaWin);
+            if (!self._spatialLayoutActive())
+                return;
+
+            if (this._layoutFrozenId > 0) {
+                GLib.source_remove(this._layoutFrozenId);
+                this._layoutFrozenId = 0;
+            }
+            // The setter calls layout_changed on the way down
+            // (workspace.js:936), which is what re-reads the row.
+            this._container.layout_manager.layout_frozen = false;
+        };
+
         this._fitAllPatched = true;
     }
 
@@ -547,9 +631,21 @@ export default class SpatialOverviewExtension extends Extension {
             proto._getSpacing = this._origGetSpacing;
         if (this._origGetWindowSlots)
             WorkspaceLayout.prototype._getWindowSlots = this._origGetWindowSlots;
+        if (this._origUpdateIconScale)
+            WindowPreview.prototype._updateIconScale = this._origUpdateIconScale;
+        if (this._origSyncOverlay)
+            WorkspaceLayout.prototype._syncOverlay = this._origSyncOverlay;
+        if (this._origAddWindow)
+            WorkspaceLayout.prototype.addWindow = this._origAddWindow;
+        if (this._origDoRemoveWindow)
+            Workspace.prototype._doRemoveWindow = this._origDoRemoveWindow;
         this._origGetFirstFitAllWorkspaceBox = null;
         this._origGetSpacing = null;
         this._origGetWindowSlots = null;
+        this._origAddWindow = null;
+        this._origUpdateIconScale = null;
+        this._origSyncOverlay = null;
+        this._origDoRemoveWindow = null;
         this._fitAllPatched = false;
     }
 
@@ -812,6 +908,7 @@ export default class SpatialOverviewExtension extends Extension {
             // at all. Everything downstream of here asks _spatialLayoutActive.
             if (ws?._fitModeAdjustment && !self._isInAppGrid()) {
                 this._spatialEngaged = true;
+                this._blockWorkspaceCollection();
                 ws._fitModeAdjustment.remove_transition('value');
 
                 // FIXME downstream: _updateDragPosition (dnd.js:373-382) is the
@@ -888,6 +985,7 @@ export default class SpatialOverviewExtension extends Extension {
                     let topProgress = 0;
                     (this._workspaces ?? []).forEach((w, index) => {
                         w.stateAdjustment.value = 1;
+                        self._syncFloatingChrome(w);
 
                         const progress =
                             1 - Math.clamp(Math.abs(adj.value - index), 0, 1);
@@ -950,27 +1048,52 @@ export default class SpatialOverviewExtension extends Extension {
                         lm._origGetWindowSlots = lm._getWindowSlots;
                         lm._spatialRefBox = lm._windowSlotsBox.copy();
                         lm._spatialRefLayout = lm._layout;
-                        lm._spatialRefSlots = lm._windowSlots;
                         lm._spatialDetached = [];
+                        this._pinSpreadSlots(lm, lm._windowSlots);
+                        for (const preview of container.get_children())
+                            this._trackFloatingGeometry(lm, preview);
 
                         lm._getWindowSlots = function (containerBox) {
                             if (!self._spatialLayoutActive() ||
                                 !this._spatialRefSlots)
                                 return this._origGetWindowSlots.call(this, containerBox);
-                            // The pin describes one layout. A drop that adds or
-                            // removes a window rebuilds it (workspace.js:672),
-                            // and re-pinning here would bake in
-                            // _adjustSpacingAndPadding's reading of a container
-                            // transform that is mid-zoom (workspace.js:500-509):
-                            // the wrong y2 clamp, hence a workspace still
-                            // mis-centred after the zoom, with nothing left to
-                            // recompute it. Drop the pin and let upstream solve
-                            // for the live box for the rest of the drag.
+                            // Nothing to pin or morph towards: the strategy
+                            // is already drawing the desktop, and it scales
+                            // into whatever box it is handed rather than
+                            // re-packing, so the shrunken fit-all box gives
+                            // the same picture smaller. Ask it every pass so
+                            // a retile lands here.
+                            if (self._strategyOwnsGeometry(this)) {
+                                return self._dropDetachedSlots(this,
+                                    this._origGetWindowSlots.call(
+                                        this, containerBox));
+                            }
+                            // The pin describes one layout, and a window
+                            // arriving or leaving rebuilds it
+                            // (workspace.js:672). Re-pin against the box the
+                            // engage froze, not against the one being asked
+                            // for: mid-zoom that box is a fraction of a
+                            // workspace, and _adjustSpacingAndPadding reads
+                            // the container's live transform to clamp it
+                            // (workspace.js:497-510). A copy, because that
+                            // clamp writes to the box it is handed.
+                            //
+                            // What the re-solve feeds is the spread end of the
+                            // morph, which fitMode weighs at zero once the
+                            // zoom has settled - where windows come and go.
                             if (this._layout !== this._spatialRefLayout) {
-                                this._spatialRefSlots = null;
-                                return this._origGetWindowSlots.call(this, containerBox);
+                                this._spatialRefLayout = this._layout;
+                                this._spatialDetached = [];
+                                self._pinSpreadSlots(this,
+                                    this._origGetWindowSlots.call(
+                                        this, this._spatialRefBox.copy()));
+                                logTime('_getWindowSlots: re-pinned', {
+                                    n: this._spatialRefSlots.length,
+                                    fit: self._floatingFitMode().toFixed(2),
+                                });
                             }
                             this._windowSlotsBox = this._spatialRefBox;
+                            self._floatWindowSlots(this);
                             return this._spatialRefSlots;
                         };
                     }
@@ -1349,6 +1472,20 @@ export default class SpatialOverviewExtension extends Extension {
         }
     }
 
+    // The same rule as _detachDraggedSlots, for the path that re-solves. The
+    // pin holds one array for the whole drag, so dropping the dragged slot
+    // from it once, at the engage, holds; a strategy asked afresh every pass
+    // hands the slot back every pass, and the clone flashes at whatever the
+    // box means inside Main.uiGroup - the top of the screen - until the next
+    // motion event puts it back under the pointer.
+    _dropDetachedSlots(lm, slots) {
+        const container = lm._container;
+        if (!container)
+            return slots;
+        const children = new Set(container.get_children());
+        return slots.filter(slot => children.has(slot[4]));
+    }
+
     // Gives back the slots dropped at engagement, once the container owns the
     // actor again. dnd reparents in _onAnimationComplete (dnd.js:518-521) and
     // emits drag-end straight after, so the slot is back before the frame that
@@ -1384,6 +1521,208 @@ export default class SpatialOverviewExtension extends Extension {
                 container.queue_relayout();
             }
         }
+    }
+
+    // FIXME downstream: at stateAdjustment 0 WorkspaceLayout already draws the
+    // picture this asks for - every window where it really is, at
+    // (boundingBox - workarea) * allocationScale (workspace.js:704-735), which
+    // is what the app grid shows. Two things keep FitMode.ALL from simply
+    // asking for it. _updateWorkspacesState drives that adjustment from
+    // workspaceMode, which is why the hook above pins it at 1; and
+    // vfunc_allocate clamps the floating box up to the slot size for as long
+    // as currentState <= WINDOW_PICKER (workspace.js:723-729), which holds for
+    // this whole zoom - it never leaves the window picker. Under that clamp a
+    // window smaller than the slot the spread handed it is drawn at the slot's
+    // size, hanging off the shrunken workspace.
+    //
+    // So the floating layout goes into the slots, where the clamp cannot reach
+    // it: upstream's own mapping, into the box the pin froze. fitMode carries
+    // the morph, so the zoom starts on the spread and lands on the desktop
+    // with upstream drawing every frame in between.
+    //
+    // Ideal upstream fix: let a WorkspacesView in FitMode.ALL ask for the
+    // floating layout, and clamp against the session only when the session is
+    // where the transition is going.
+    // Keyed by actor, not by index: _detachDraggedSlots splices the pinned
+    // array, and _floatWindowSlots writes the morph into the entries it holds.
+    _pinSpreadSlots(lm, slots) {
+        lm._spatialRefSlots = slots;
+        lm._spatialSpreadSlots = new Map(slots.map(
+            ([x, y, width, height, child]) => [child, [x, y, width, height]]));
+    }
+
+    // FIXME downstream: a window leaving the workspace it was the last one on
+    // empties that workspace, and _checkWorkspaces collects an empty workspace
+    // as soon as the later after the drop runs (windowManager.js:283-289).
+    // Every workspace past it slides down one, so a window dropped on the
+    // third workspace is on the second by the time the drop animation ends -
+    // the row reindexes under a gesture that is still going.
+    //
+    // The tracker already knows how to hold still: blockUpdates is what the
+    // workspace switcher popup takes while it is on screen
+    // (windowManager.js:1808-1817). Fit-all is the same kind of moment, only
+    // longer - the whole row is on screen and being dragged across.
+    // Collection resumes on the way out, which is where upstream would have
+    // done it anyway.
+    //
+    // Ideal upstream fix: block updates for the duration of any overview drag,
+    // not only for the switcher popup.
+    _blockWorkspaceCollection() {
+        const tracker = Main.wm?._workspaceTracker;
+        if (!tracker || this._workspaceCollectionBlocked)
+            return;
+
+        tracker.blockUpdates();
+        this._workspaceCollectionBlocked = true;
+    }
+
+    _unblockWorkspaceCollection() {
+        if (!this._workspaceCollectionBlocked)
+            return;
+
+        this._workspaceCollectionBlocked = false;
+        // The check the block deferred is still queued: _queueCheckWorkspaces
+        // returns SOURCE_CONTINUE while paused (windowManager.js:231-233), so
+        // it runs itself once this clears.
+        Main.wm?._workspaceTracker?.unblockUpdates();
+    }
+
+    // Owned by the layout manager, so a preview that is destroyed or a
+    // workspace that goes away takes the handler with it, and
+    // _restoreWorkspacesState can hand back a whole workspace at once.
+    //
+    // Called from _floatWindowSlots as well as from the engage, because the
+    // slot array is the only place that is guaranteed to name the previews
+    // being drawn: a workspace rebuilt mid-drag brings previews that were
+    // never handed to either the engage or addWindow, and a preview whose
+    // geometry nothing re-reads is one that keeps drawing where it used to
+    // be.
+    _trackFloatingGeometry(lm, preview) {
+        if (preview._spatialTrackedBy === lm)
+            return;
+        preview._spatialTrackedBy = lm;
+
+        const refloat = () => {
+            if (!lm._spatialRefSlots)
+                return;
+            // A strategy that answers from its own model re-reads nothing
+            // from here; it announces its own changes (workspace.js:671-680,
+            // via mosaicwm/mosaicRenderer.js:48-49) and the slot pass follows.
+            if (this._strategyOwnsGeometry(lm))
+                return;
+            // The window set has not changed, only where one of them is, so
+            // the spread reference still stands and only the floating end
+            // needs re-reading.
+            this._floatWindowSlots(lm);
+            lm._container?.queue_relayout();
+        };
+
+        // The cache the floating layout reads is filled from this one
+        // property (windowPreview.js:79-98), so this is the signal that says
+        // "the number you are drawing from just changed". WindowPreview's own
+        // size-changed is a filtered relay of it - it drops the notification
+        // whenever the box is empty (windowPreview.js:96-97), which is
+        // precisely the state a window being dragged passes through.
+        preview.windowContainer?.layout_manager?.connectObject(
+            'notify::bounding-box', refloat, lm);
+        // Mutter's own pair, for the case where the actor's box has not
+        // caught up yet: upstream only takes size-changed (workspace.js:801),
+        // and a window that is moved without being resized never reaches it.
+        preview.metaWindow?.connectObject(
+            'position-changed', refloat,
+            'size-changed', refloat,
+            lm);
+    }
+
+    // Read while engaged, an unanswerable question is FitMode.ALL and not
+    // FitMode.SINGLE: SINGLE is a real answer here - _floatWindowSlots reads
+    // it as "draw the spread" - so falling back to it turns a lookup that
+    // came up empty into a workspace that silently reverts, which is what a
+    // drop used to do until the next relayout.
+    _floatingFitMode() {
+        if (!this._spatialLayoutActive())
+            return FitMode.SINGLE;
+
+        const adj = this._getWsDisplay()?._fitModeAdjustment;
+        if (!adj) {
+            logTime('_floatingFitMode: engaged with no adjustment');
+            return FitMode.ALL;
+        }
+        return adj.value;
+    }
+
+    // Whether someone other than the shell answers for where a window goes.
+    //
+    // The shell's own strategy re-packs windows into rows and ignores where
+    // they really are (workspace.js:145), so fit-all has to build the desktop
+    // picture itself. A strategy installed by another extension already
+    // answers in desktop geometry - and answers from its own model rather
+    // than from the window, which is the only source that is current here:
+    // with the overview up, Mutter drops the moves a tiling extension makes,
+    // so it holds them until the overview hides and the real windows stay
+    // where they were (mosaicwm/mosaicModel.js:32, mosaicwm/extension.js:533).
+    // Floating over that draws a desktop that has not existed for a while.
+    //
+    // By class name because UnalignedLayoutStrategy is not exported.
+    _strategyOwnsGeometry(lm) {
+        const name = lm._layoutStrategy?.constructor?.name;
+        return !!name && name !== 'UnalignedLayoutStrategy';
+    }
+
+    // Which box says where the window is: upstream's own answer for its
+    // floating branch, WindowPreview.boundingBox (workspace.js:707-711) - the
+    // union of the actors the preview draws, so it covers shadows and
+    // attached dialogs, which the frame rect does not.
+    //
+    // It also covers the case the frame rect gets wrong. A window shrunk by
+    // an extension that scales the actor keeps its full-size frame - measured
+    // in the nested shell against a tiling extension's own log, a window it
+    // had scaled to 256x205 at (586,314) still answered get_frame_rect with
+    // 642x515 at (577,158), and that is the frame it will still answer with
+    // after the scale is undone. The bounding box follows what is drawn.
+    _floatWindowSlots(lm) {
+        const workarea = lm._workarea;
+        const spread = lm._spatialSpreadSlots;
+        if (!workarea?.width || !spread)
+            return;
+
+        const fitMode = this._floatingFitMode();
+        const scale = lm._spatialRefBox.get_width() / workarea.width;
+
+        for (const slot of lm._spatialRefSlots) {
+            this._trackFloatingGeometry(lm, slot[4]);
+
+            const from = spread.get(slot[4]);
+            const {x, y, width, height} = slot[4].boundingBox ?? {};
+            // A window with nothing to show yet has no box to fly to.
+            if (!from || !(width > 0))
+                continue;
+
+            const to = [
+                (x - workarea.x) * scale, (y - workarea.y) * scale,
+                width * scale, height * scale,
+            ];
+            for (let i = 0; i < 4; i++)
+                slot[i] = from[i] + (to[i] - from[i]) * fitMode;
+        }
+    }
+
+    // The app icon and the hover overlay are drawn for the spread and outlive
+    // it: the icon's scale follows the overview state, which stays on
+    // WINDOW_PICKER for the whole zoom (windowPreview.js:238-251), and
+    // _syncOverlay keys off the state adjustment the hook pins at 1
+    // (workspace.js:775-777). Both would sit over a layout that has no room
+    // for them - the icons the issue calls distracting, on windows small
+    // enough that the overlay covers what it labels.
+    _syncFloatingChrome(workspace) {
+        const container = workspace._container;
+
+        // Both are patched to read the zoom, so asking upstream's own
+        // question again is what carries the fade - and what hands the answer
+        // back whole once the zoom is over.
+        for (const preview of container?.get_children() ?? [])
+            preview._updateIconScale?.();
+        container?.layout_manager?.syncOverlays();
     }
 
     // Runs the callback once the actor's geometry can be read back, i.e. once
@@ -1896,6 +2235,7 @@ export default class SpatialOverviewExtension extends Extension {
     }
 
     _restoreWorkspacesState() {
+        this._unblockWorkspaceCollection();
         this._reattachDetachedSlots();
         const ws = this._getWsDisplay();
         for (const view of ws?._workspacesViews ?? []) {
@@ -1912,12 +2252,24 @@ export default class SpatialOverviewExtension extends Extension {
             for (const w of view._workspaces ?? []) {
                 const container = w._container;
                 const lm = container?.layout_manager;
+                // The hook stops running the moment _spatialLayoutActive turns
+                // false, which can be a frame before the zoom-in ends, so the
+                // icons and overlays are handed back from here rather than
+                // from its last pass.
+                this._syncFloatingChrome(w);
+                for (const preview of container?.get_children() ?? []) {
+                    preview._spatialTrackedBy = null;
+                    preview.windowContainer?.layout_manager
+                        ?.disconnectObject(lm);
+                    preview.metaWindow?.disconnectObject(lm);
+                }
                 if (lm && lm._origGetWindowSlots !== undefined) {
                     lm._getWindowSlots = lm._origGetWindowSlots;
                     lm._origGetWindowSlots = undefined;
                     lm._spatialRefBox = undefined;
                     lm._spatialRefSlots = undefined;
                     lm._spatialRefLayout = undefined;
+                    lm._spatialSpreadSlots = undefined;
                     lm._spatialDetached = undefined;
                 }
             }
