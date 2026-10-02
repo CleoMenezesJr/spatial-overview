@@ -1553,10 +1553,18 @@ export default class SpatialOverviewExtension extends Extension {
                 // Morph the slot here first, and hand the chrome back by the
                 // same pass the other previews get theirs from - the returning
                 // one shows what the drag left behind (windowPreview.js:661-668).
+                //
+                // Not while the zoom runs: the box changes every frame, which
+                // re-reads the slots anyway, and a _needsLayout pass counts as
+                // layoutChanged, which eases every preview in the workspace
+                // over 200ms from where it stood (workspace.js:671-675,
+                // 758-759, 389-399) - the ones that never left lag the zoom.
                 this._floatWindowSlots(lm);
                 this._syncFloatingChrome(w);
                 lm.layout_frozen = false;
-                lm._needsLayout = true;
+                if (!this._getWsDisplay()?._fitModeAdjustment
+                    ?.get_transition('value'))
+                    lm._needsLayout = true;
                 view.queue_relayout();
                 container.queue_relayout();
             }
