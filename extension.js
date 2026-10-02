@@ -29,10 +29,6 @@ const ZOOM_IN_DURATION = 400;
 // animation queued behind it.
 const ZOOM_IN_ACTIVATE_DURATION = 200;
 const ZOOM_OUT_HOLD_DELAY = 150;
-// How long a deferred snap-back waits for the zoom before finishing itself.
-// Comfortably past ZOOM_OUT_DURATION, so a zoom that is merely running always
-// gets there first and this only ever answers for one that was cut short.
-const SNAP_BACK_FALLBACK_DELAY = 1000;
 const BACKDROP_OPACITY = 180;
 const MIN_WS_SCALE = 0.18;
 // Gap between fit-all workspaces, as a fraction of a workspace's own size.
@@ -271,14 +267,12 @@ export default class SpatialOverviewExtension extends Extension {
         this._dragEndId = null;
         this._dragCancelledId = null;
         this._overviewHidingId = null;
-        this._escapeCapturedId = 0;
         this._progressSignalId = null;
         this._fitModeNotifyId = 0;
         this._fitModeNotifyAdj = null;
         this._restoreIdleId = 0;
         this._engageTimeoutId = 0;
-        this._snapBackFallbackId = 0;
-        this._deferredSnapBack = null;
+        this._snapBackRetarget = null;
         this._spatialEngaged = false;
         this._dropInsertIndex = -1;
         this._dropWorkspaceIndex = -1;
@@ -334,8 +328,8 @@ export default class SpatialOverviewExtension extends Extension {
                 logTime('SIGNAL window-drag-cancelled from overview');
                 this._onDragEnd(true);
             });
-        // Fit-all now outlives the drag, so it can also outlive the overview:
-        // clicking a window preview activates it (workspace.js:1393-1397) and
+        // The zoom-in after a drag can outlive the overview: clicking a window
+        // preview while it runs activates it (workspace.js:1393-1397) and
         // that hides the overview from under us. The leave animation reads the
         // workspace geometry, and in FitMode.ALL that geometry is the shrunken
         // one.
@@ -562,7 +556,7 @@ export default class SpatialOverviewExtension extends Extension {
         };
 
         // Both of these answer for a preview that may be born, or re-asked,
-        // long after the zoom settled - a window opened while fit-all is held
+        // long after the zoom settled - a window opened while fit-all is up
         // builds its WindowPreview then, and its constructor calls
         // _updateIconScale on the spot (windowPreview.js:227). Pushing the
         // floating chrome from the zoom's own frames reaches neither.
@@ -686,7 +680,6 @@ export default class SpatialOverviewExtension extends Extension {
     disable() {
         this._restoreMinWorkspaces();
 
-        this._finishDeferredSnapBack();
         if (this._dragActive)
             this._onDragEnd();
 
@@ -720,8 +713,7 @@ export default class SpatialOverviewExtension extends Extension {
             this._overviewHidingId = null;
         }
 
-        this._disarmFitAllEscape();
-        // The adjustment is the shell's own. Disabling while held in fit-all
+        // The adjustment is the shell's own. Disabling while in fit-all
         // would leave it there with nothing left to ease it back.
         const fitAdj = this._getWsDisplay()?._fitModeAdjustment;
         if (this._spatialEngaged && fitAdj) {
@@ -732,8 +724,7 @@ export default class SpatialOverviewExtension extends Extension {
         this._disconnectFitModeNotify();
         this._removeRestoreIdle();
         this._removeEngageTimeout();
-        this._removeSnapBackFallback();
-        this._cancelAllocationWait();
+        this._stopSnapBackRetarget();
         this._spatialEngaged = false;
         this._restoreWorkspacesState();
         this._restorePreviewActivate();
@@ -756,12 +747,6 @@ export default class SpatialOverviewExtension extends Extension {
     _onDragBegin(metaWindow) {
         logTime('_onDragBegin ENTER (zoom-out held back)');
         this._dragActive = true;
-        // A drag started from a held fit-all: Esc is dnd's for its duration, it
-        // cancels the drag (dnd.js:568-570). Which of the two handlers the key
-        // reaches first is not ours to assume - dnd's grab redirects events to
-        // its own actor and skips the capture phase we listen on (dnd.js:44-45)
-        // - so disarm instead of racing. _onDragEnd arms it again.
-        this._disarmFitAllEscape();
         const self = this;
         this._draggedMetaWindow = metaWindow;
 
@@ -792,8 +777,7 @@ export default class SpatialOverviewExtension extends Extension {
                     // dnd cannot see it. The snap-back therefore aims at the
                     // fit-single slot and _onAnimationComplete reparents the
                     // clone onto the fit-all one (dnd.js:519-524). Their
-                    // difference is the jump. A drag begun with fit-all already
-                    // held has none: there the two readings agree.
+                    // difference is the jump.
                     //
                     // Ideal upstream fix: record the restore location as a
                     // fraction of the parent rather than in pixels.
@@ -828,119 +812,74 @@ export default class SpatialOverviewExtension extends Extension {
                     // FIXME downstream: the ratio above is only as good as the
                     // moment it is read, and _animateDragEnd eases to a single
                     // reading taken at the drop (dnd.js:494-505). Upstream can
-                    // afford that: nothing relayouts a workspace mid-drag. The
-                    // zoom-out does, for 210ms, so a drop taken while it is in
-                    // flight measures a container that is still shrinking -
-                    // 868px one frame in, against the 423px it settles at, so
-                    // the snap-back is aimed at roughly twice its final size.
+                    // afford that: nothing relayouts a workspace mid-drag. Here
+                    // every drag end runs the 400ms zoom-in, so the snap-back
+                    // starts against a container that is still growing and
+                    // would land on the size it had at the drop.
                     //
-                    // Wait the row out instead: the snap-back is 250ms and
-                    // starts at the drop, the zoom is 210ms and started before
-                    // it, so the row always settles first and there is always a
-                    // frame where the reading is final. The clone holds where it
-                    // was dropped until then.
+                    // Re-aim it instead, once per allocation of the container
+                    // it returns to: the tween keeps its progress and only its
+                    // end moves. notify::allocation and not a frame callback -
+                    // get_width() on an actor still owing an allocation answers
+                    // with its preferred width, which for WorkspaceLayout is the
+                    // whole workarea (workspace.js:607-609). The 250ms tween
+                    // ends inside the zoom; from there the container lays the
+                    // preview out itself.
                     //
                     // Ideal upstream fix: let a drag origin whose geometry is
-                    // animating defer the snap-back until it settles, the way a
-                    // drop target could invalidate a stale hover.
+                    // animating have the snap-back follow it, the way a drop
+                    // target could invalidate a stale hover.
                     this._origAnimateDragEnd = draggable._animateDragEnd;
                     const origAnimateDragEnd = this._origAnimateDragEnd;
                     draggable._animateDragEnd = function (eventTime, params) {
-                        const transition = self._getWsDisplay()
+                        const parent = this._dragOrigParent;
+                        const zooming = !!self._getWsDisplay()
                             ?._fitModeAdjustment?.get_transition('value');
-                        if (!transition) {
-                            origAnimateDragEnd.call(this, eventTime, params);
+                        // dnd holds its grab until _dragComplete (dnd.js:
+                        // 543-544), so a second Esc or the button release
+                        // reaches _cancelDrag again mid-tween (dnd.js:569-570,
+                        // 450). Its ease removes this one's transitions, which
+                        // stops them unfinished, and onStopped reparents the
+                        // clone where it stands (environment.js:161-163,
+                        // dnd.js:500-502). The tween running already goes to
+                        // the same place.
+                        if (self._snapBackRetarget) {
+                            logTime('snap-back already running');
                             return;
                         }
 
-                        logTime('snap-back deferred until the zoom settles');
-                        // What _animateDragEnd would have set. The drag is
-                        // already on its way back, and a clone destroyed before
-                        // the tween starts still has to reach _finishAnimation
-                        // (dnd.js:236-237) for the draggable to be torn down.
-                        this._animationInProgress = true;
-                        // Not on 'stopped' alone: the value that ends the
-                        // transition only queues the relayout that resolves the
-                        // row (workspacesView.js:99-103), and 'stopped' lands in
-                        // the same frame. get_width() on an actor still owing an
-                        // allocation answers with its preferred width, which for
-                        // WorkspaceLayout is the whole workarea (workspace.js:
-                        // 607-609) - a constant, and the ratio built from it
-                        // read 1.29 no matter when the drop came.
-                        let transitionId = 0;
-                        let settled = false;
-                        const finishSnapBack = () => {
-                            if (settled)
+                        origAnimateDragEnd.call(this, eventTime, params);
+                        if (!zooming || !parent || !this._dragActor)
+                            return;
+
+                        logTime('snap-back follows the zoom');
+                        const retarget = () => {
+                            const actor = this._dragActor;
+                            if (!actor || !parent.has_allocation())
                                 return;
-                            settled = true;
-                            if (transitionId) {
-                                transition.disconnect(transitionId);
-                                transitionId = 0;
+                            const [x, y, scale] = this._getRestoreLocation();
+                            // _restoreDragActor fades in at the location and
+                            // eases opacity alone (dnd.js:481-491).
+                            if (!('x' in params)) {
+                                actor.set_position(x, y);
+                                actor.set_scale(scale, scale);
+                                return;
                             }
-                            self._deferredSnapBack = null;
-                            self._removeSnapBackFallback();
-                            // Nothing left to put back: the clone was
-                            // destroyed under the deferral and dnd already
-                            // unwound the drag from its destroy handler
-                            // (dnd.js:430-437).
-                            if (!this._dragActor)
-                                return;
-
-                            self._afterAllocation(this._dragOrigParent, () => {
-                                if (!this._dragActor)
-                                    return;
-                                this._animationInProgress = false;
-
-                                const [x, y, scale] =
-                                    this._getRestoreLocation();
-                                // _cancelDrag eases to the location it read
-                                // (dnd.js:603-611); _restoreDragActor puts the
-                                // clone there first and eases opacity alone
-                                // (dnd.js:481-491). Both readings are the stale
-                                // one, so replace whichever this call carries.
-                                if ('x' in params) {
-                                    origAnimateDragEnd.call(this, eventTime, {
-                                        ...params,
-                                        x, y,
-                                        scale_x: scale, scale_y: scale,
-                                    });
-                                } else {
-                                    this._dragActor.set_position(x, y);
-                                    this._dragActor.set_scale(scale, scale);
-                                    origAnimateDragEnd.call(
-                                        this, eventTime, params);
-                                }
-                            });
+                            actor.get_transition('x')?.set_to(x);
+                            actor.get_transition('y')?.set_to(y);
+                            actor.get_transition('scale-x')?.set_to(scale);
+                            actor.get_transition('scale-y')?.set_to(scale);
                         };
-                        transitionId = transition.connect('stopped',
-                            finishSnapBack);
-                        // remove_transition() never completes the transition it
-                        // drops, so 'stopped' dies with the zoom that Esc cut
-                        // short (_leaveFitAll). A timeout is the only way to
-                        // hear that: without it the clone would sit in the
-                        // uiGroup, the preview would stay gone from the row.
-                        // On the extension, not on the draggable: disable()
-                        // has to be able to reach both of these.
-                        self._deferredSnapBack = finishSnapBack;
-                        self._snapBackFallbackId = GLib.timeout_add(
-                            GLib.PRIORITY_DEFAULT, SNAP_BACK_FALLBACK_DELAY,
-                            () => {
-                                self._snapBackFallbackId = 0;
-                                if (!this._animationInProgress)
-                                    return GLib.SOURCE_REMOVE;
-                                logTime('snap-back fallback: zoom never '
-                                    + 'settled, completing the restore');
-                                finishSnapBack();
-                                return GLib.SOURCE_REMOVE;
-                            });
+                        self._snapBackRetarget = {
+                            parent,
+                            id: parent.connect('notify::allocation', retarget),
+                        };
                     };
 
                     const restoreId = draggable.connect('drag-end', () => {
-                        // Either the deferral finished and cleared these, or
-                        // the clone was destroyed under it and dnd ended the
-                        // drag without one. Nothing left to wait for.
-                        self._deferredSnapBack = null;
-                        self._removeSnapBackFallback();
+                        // The tween ended, or the clone was destroyed under it
+                        // and dnd ended the drag without one.
+                        self._stopSnapBackRetarget();
                         self._reattachDetachedSlots();
                         draggable._getRestoreLocation =
                             self._origGetRestoreLocation;
@@ -1192,8 +1131,7 @@ export default class SpatialOverviewExtension extends Extension {
                     }
 
                     // Every engage, not only the one that installs the pin: a
-                    // drag begun from a held fit-all finds the pin already
-                    // there, and its clone would keep its slot.
+                    // pin already in place would keep the clone's slot.
                     if (lm?._spatialRefSlots)
                         this._detachDraggedSlots(lm, container);
                 }
@@ -1370,16 +1308,10 @@ export default class SpatialOverviewExtension extends Extension {
 
         const ws = this._getWsDisplay();
 
-        // Releasing the window is not what leaves fit-all - Esc is. A drag that
-        // never got as far as zooming out has nothing to hold, so it still
-        // unwinds here.
-        //
-        // Cancelled drags hold too. Esc during a drag already means "cancel the
-        // drag" (dnd.js:568-570), so a cancel that also left fit-all would make
-        // one key do two things. The second Esc is the one that leaves.
+        // Fit-all lasts as long as the drag, cancelled ones included.
         if (this._spatialLayoutActive()) {
-            logTime('_onDragEnd: holding fit-all', {isCancel});
-            this._armFitAllEscape();
+            logTime('_onDragEnd: leaving fit-all', {isCancel});
+            this._leaveFitAll();
         } else {
             logTime('_onDragEnd: not engaged, nothing to hold', {isCancel});
             this._spatialEngaged = false;
@@ -1448,40 +1380,8 @@ export default class SpatialOverviewExtension extends Extension {
         this._origPreviewActivate = null;
     }
 
-    // Esc is the way out of fit-all. Capture phase, which is upstream's own
-    // idiom for the same key (grabHelper.js:168-176): the search controller
-    // takes Esc on the stage's key-press-event and turns it into
-    // Main.overview.hide() (searchController.js:152-158), and that handler is
-    // reconnected on every overview show, so it would always be the newer of
-    // the two in the bubble phase.
-    _armFitAllEscape() {
-        if (this._escapeCapturedId)
-            return;
-
-        this._escapeCapturedId = global.stage.connect('captured-event',
-            (_actor, event) => {
-                if (event.type() !== Clutter.EventType.KEY_PRESS ||
-                    event.get_key_symbol() !== Clutter.KEY_Escape)
-                    return Clutter.EVENT_PROPAGATE;
-
-                logTime('Esc: leaving fit-all');
-                this._leaveFitAll();
-                return Clutter.EVENT_STOP;
-            });
-    }
-
-    _disarmFitAllEscape() {
-        if (!this._escapeCapturedId)
-            return;
-
-        global.stage.disconnect(this._escapeCapturedId);
-        this._escapeCapturedId = 0;
-    }
-
     _leaveFitAll({animate = true, onDone = null, scrollTo = -1,
         duration = ZOOM_IN_DURATION} = {}) {
-        this._disarmFitAllEscape();
-
         // The overview is already going. prepareToLeaveOverview freezes each
         // WorkspaceLayout (workspace.js:1299) before 'hiding' is emitted
         // (overview.js:574-575), so the slots are fixed by the time we get here
@@ -1609,18 +1509,27 @@ export default class SpatialOverviewExtension extends Extension {
                 const lm = container?.layout_manager;
                 if (!lm?._spatialDetached?.length)
                     continue;
-                // Pin dropped: upstream is solving for the live box again and
-                // _windowSlots is its array, not ours to splice into. It also
-                // rebuilt the layout, so the returning preview gets a slot on
-                // its own.
-                if (!lm._spatialRefSlots) {
-                    lm._spatialDetached = [];
-                    continue;
-                }
                 // Asked of the container, not of the actor: a cross-workspace
                 // drop destroys the preview, and get_parent() on the disposed
                 // wrapper is a Gjs-CRITICAL. Set membership never reaches C.
                 const children = new Set(container.get_children());
+                // Pin dropped: upstream is solving for the live box again and
+                // _windowSlots is its array, not ours to splice into. But if
+                // the pin went while the preview was still in Main.uiGroup,
+                // that array is the pinned one, solved without it, and
+                // vfunc_allocate keeps it until _needsLayout
+                // (workspace.js:669-680). Ask for the re-solve once the
+                // preview is back.
+                if (!lm._spatialRefSlots) {
+                    const pending = lm._spatialDetached.filter(
+                        ([, slot]) => !children.has(slot[4]));
+                    if (pending.length === lm._spatialDetached.length)
+                        continue;
+                    lm._spatialDetached = pending;
+                    lm._needsLayout = true;
+                    container.queue_relayout();
+                    continue;
+                }
                 let reattached = false;
                 lm._spatialDetached = lm._spatialDetached.filter(([i, slot]) => {
                     if (!children.has(slot[4]))
@@ -1879,48 +1788,6 @@ export default class SpatialOverviewExtension extends Extension {
         lm?.syncOverlays();
     }
 
-    // Runs the callback once the actor's geometry can be read back, i.e. once
-    // it stops owing an allocation. Callers that only need to know a relayout
-    // was queued have notify::allocation; this is for the ones that need the
-    // answer.
-    _afterAllocation(actor, callback) {
-        this._cancelAllocationWait();
-
-        if (!actor || actor.has_allocation()) {
-            callback();
-            return;
-        }
-
-        const fire = () => {
-            this._cancelAllocationWait();
-            callback();
-        };
-
-        const wait = {actor, allocationId: 0, timeoutId: 0};
-        this._allocationWait = wait;
-        wait.allocationId = actor.connect('notify::allocation', fire);
-        // A relayout that lands on the geometry the actor already had clears
-        // the debt without changing the box, and notify::allocation carries
-        // the change, not the clearing. Waiting on it alone can wait forever.
-        wait.timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 50, () => {
-            wait.timeoutId = 0;
-            fire();
-            return GLib.SOURCE_REMOVE;
-        });
-    }
-
-    _cancelAllocationWait() {
-        const wait = this._allocationWait;
-        if (!wait)
-            return;
-
-        this._allocationWait = null;
-        if (wait.allocationId)
-            wait.actor.disconnect(wait.allocationId);
-        if (wait.timeoutId)
-            GLib.source_remove(wait.timeoutId);
-    }
-
     _removeRestoreIdle() {
         if (this._restoreIdleId) {
             GLib.source_remove(this._restoreIdleId);
@@ -1935,27 +1802,13 @@ export default class SpatialOverviewExtension extends Extension {
         }
     }
 
-    _removeSnapBackFallback() {
-        if (this._snapBackFallbackId) {
-            GLib.source_remove(this._snapBackFallbackId);
-            this._snapBackFallbackId = 0;
-        }
-    }
-
-    // A deferred snap-back is a drag dnd still believes is animating: drop it
-    // and _onAnimationComplete never runs, so the clone stays in Main.uiGroup
-    // with the pointer still grabbed. The zoom it waits on is removed further
-    // down in disable(), and remove_transition() does not emit 'stopped', so
-    // there would be nothing left to hear it either. Finish it instead - the
-    // parent owes no allocation at this point, so _afterAllocation answers in
-    // the same frame.
-    _finishDeferredSnapBack() {
-        const finish = this._deferredSnapBack;
-        if (!finish)
+    _stopSnapBackRetarget() {
+        const retarget = this._snapBackRetarget;
+        if (!retarget)
             return;
 
-        logTime('disable: finishing the deferred snap-back');
-        finish();
+        this._snapBackRetarget = null;
+        retarget.parent.disconnect(retarget.id);
     }
 
     // FIXME downstream: the upstream "new-workspace indicator via drop" lives
@@ -2447,7 +2300,10 @@ export default class SpatialOverviewExtension extends Extension {
                     lm._spatialRefSlots = undefined;
                     lm._spatialRefLayout = undefined;
                     lm._spatialSpreadSlots = undefined;
-                    lm._spatialDetached = undefined;
+                    // Not the entries still waiting on their preview:
+                    // _reattachDetachedSlots needs them for the re-solve.
+                    if (!lm._spatialDetached?.length)
+                        lm._spatialDetached = undefined;
                 }
             }
         }
