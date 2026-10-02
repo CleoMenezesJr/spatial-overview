@@ -14,7 +14,7 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as DND from 'resource:///org/gnome/shell/ui/dnd.js';
 import {FitMode, WorkspacesView} from 'resource:///org/gnome/shell/ui/workspacesView.js';
 import {ControlsState} from 'resource:///org/gnome/shell/ui/overviewControls.js';
-import {HotCorner} from 'resource:///org/gnome/shell/ui/layout.js';
+import {HotCorner, MonitorConstraint} from 'resource:///org/gnome/shell/ui/layout.js';
 import {WindowPreview} from 'resource:///org/gnome/shell/ui/windowPreview.js';
 import {Workspace, WorkspaceLayout} from 'resource:///org/gnome/shell/ui/workspace.js';
 
@@ -76,21 +76,17 @@ const ZoomOutView = GObject.registerClass({
         super._init({
             reactive: true,
             visible: false,
-            x: 0,
-            y: 0,
-            x_expand: true,
-            y_expand: true,
         });
+        // Like OverviewActor (overview.js:37). overviewGroup is bound to
+        // uiGroup (layout.js:256-263), so with a monitor left of or above the
+        // primary, its origin is not the primary's.
+        this.add_constraint(new MonitorConstraint({primary: true}));
 
         this._delegate = this;
         this._extension = null;
 
-        this._progressAdj = new St.Adjustment({
-            actor: this,
-            value: 0,
-            lower: 0,
-            upper: 1,
-        });
+        this._hideTimeoutId = 0;
+        this.connect('destroy', () => this._removeHideTimeout());
 
         // FIXME downstream: replica of the upstream ThumbnailsBox
         // _dropPlaceholder (workspaceThumbnail.js:613). Used to signal
@@ -128,23 +124,27 @@ const ZoomOutView = GObject.registerClass({
 
     show() {
         logTime('VIEW.show start (zoom-out)');
+        this._removeHideTimeout();
         this.visible = true;
-        this._progressAdj.ease(1, {
-            duration: ZOOM_OUT_DURATION,
-            mode: Clutter.AnimationMode.EASE_OUT_CUBIC,
-        });
     }
 
     hide() {
         logTime('VIEW.hide start (zoom-in)');
-        this._progressAdj.ease(0, {
-            duration: ZOOM_IN_DURATION,
-            mode: Clutter.AnimationMode.EASE_OUT_CUBIC,
-            onComplete: () => {
+        this._removeHideTimeout();
+        this._hideTimeoutId = GLib.timeout_add(
+            GLib.PRIORITY_DEFAULT, ZOOM_IN_DURATION, () => {
+                this._hideTimeoutId = 0;
                 logTime('VIEW.hide onComplete (zoom-in DONE)');
                 this.visible = false;
-            },
-        });
+                return GLib.SOURCE_REMOVE;
+            });
+    }
+
+    _removeHideTimeout() {
+        if (this._hideTimeoutId) {
+            GLib.source_remove(this._hideTimeoutId);
+            this._hideTimeoutId = 0;
+        }
     }
 
     vfunc_allocate(box) {
@@ -161,24 +161,10 @@ const ZoomOutView = GObject.registerClass({
         }
     }
 
-    vfunc_get_preferred_width() {
-        const mon = Main.layoutManager.monitors[
-            Main.layoutManager.primaryIndex];
-        return [0, mon ? mon.width : 1920];
-    }
-
-    vfunc_get_preferred_height() {
-        const mon = Main.layoutManager.monitors[
-            Main.layoutManager.primaryIndex];
-        return [0, mon ? mon.height : 1080];
-    }
-
     handleDragOver(source, _dragActor, x, y, _time) {
         if (!this._extension)
             return DND.DragMotionResult.CONTINUE;
 
-        this._extension._lastDragOverX = x;
-        this._extension._lastDragOverY = y;
 
         // FIXME downstream: in GNOME upstream, only the ThumbnailsBox uses
         // _dropPlaceholder + insertWorkspace. We extend the same semantics
