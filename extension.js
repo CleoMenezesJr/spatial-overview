@@ -28,7 +28,6 @@ const ZOOM_IN_DURATION = 400;
 // Shorter than ZOOM_IN_DURATION: this zoom-in has the overview's own leave
 // animation queued behind it.
 const ZOOM_IN_ACTIVATE_DURATION = 200;
-const ZOOM_OUT_HOLD_DELAY = 150;
 const BACKDROP_OPACITY = 180;
 const MIN_WS_SCALE = 0.18;
 // Gap between fit-all workspaces, as a fraction of a workspace's own size.
@@ -271,7 +270,8 @@ export default class SpatialOverviewExtension extends Extension {
         this._fitModeNotifyId = 0;
         this._fitModeNotifyAdj = null;
         this._restoreIdleId = 0;
-        this._engageTimeoutId = 0;
+        this._engageEdgeY = null;
+        this._dragEngaged = false;
         this._snapBackRetarget = null;
         this._spatialEngaged = false;
         this._dropInsertIndex = -1;
@@ -723,7 +723,6 @@ export default class SpatialOverviewExtension extends Extension {
 
         this._disconnectFitModeNotify();
         this._removeRestoreIdle();
-        this._removeEngageTimeout();
         this._stopSnapBackRetarget();
         this._spatialEngaged = false;
         this._restoreWorkspacesState();
@@ -745,8 +744,11 @@ export default class SpatialOverviewExtension extends Extension {
     }
 
     _onDragBegin(metaWindow) {
-        logTime('_onDragBegin ENTER (zoom-out held back)');
+        logTime('_onDragBegin ENTER');
         this._dragActive = true;
+        this._dragEngaged = false;
+        this._engageEdgeY = this._fitAllEdgeY();
+        logTime('_onDragBegin: fit-all above', {y: this._engageEdgeY});
         const self = this;
         this._draggedMetaWindow = metaWindow;
 
@@ -892,6 +894,15 @@ export default class SpatialOverviewExtension extends Extension {
                 this._lastCursorX = dragEvent.x;
                 this._lastCursorY = dragEvent.y;
                 this._dragMotionCount++;
+                // Fit-all is asked for by carrying the window up into the top
+                // bar. Below that the drag stays upstream's, neighbours
+                // peeking in from the sides included.
+                if (!this._dragEngaged && this._engageEdgeY !== null &&
+                    dragEvent.y < this._engageEdgeY) {
+                    this._dragEngaged = true;
+                    logTime('dragMotion: into the top bar', {y: dragEvent.y});
+                    this._engageSpatialLayout();
+                }
                 if (this._dragMotionCount % 10 === 1)
                     logTime('dragMotion', {
                         n: this._dragMotionCount,
@@ -906,18 +917,18 @@ export default class SpatialOverviewExtension extends Extension {
         };
         DND.addDragMonitor(this._dragMonitor);
 
-        // Deferring the monitor along with it would lose the capture: the
-        // draggable and its restore location are read on the first motion
-        // event. Until _engageSpatialLayout runs the ZoomOutView stays hidden,
-        // so a drag released within the delay never reaches our acceptDrop and
-        // the drop falls through to upstream.
-        this._removeEngageTimeout();
-        this._engageTimeoutId = GLib.timeout_add(
-            GLib.PRIORITY_DEFAULT, ZOOM_OUT_HOLD_DELAY, () => {
-                this._engageTimeoutId = 0;
-                this._engageSpatialLayout();
-                return GLib.SOURCE_REMOVE;
-            });
+        // Until _engageSpatialLayout runs the ZoomOutView stays hidden, so a
+        // drag released before it never reaches our acceptDrop and the drop
+        // falls through to upstream.
+    }
+
+    // Stage y of the top edge of the search entry, read once per drag: nothing
+    // relayouts it before the engage. ControlsManagerLayout puts the entry at
+    // the top of the work area (overviewControls.js:157-168), so above it is
+    // the top bar.
+    _fitAllEdgeY() {
+        const entry = this._getControls()?._searchEntry;
+        return entry ? entry.get_transformed_position()[1] : null;
     }
 
     _engageSpatialLayout() {
@@ -1285,13 +1296,10 @@ export default class SpatialOverviewExtension extends Extension {
         // second handler onto it rather than replace this one.
         this._disconnectFitModeNotify();
 
-        const heldBack = this._engageTimeoutId !== 0;
-        this._removeEngageTimeout();
-
         logTime('_onDragEnd START', {
             dragMotionTotal: this._dragMotionCount,
             isCancel,
-            heldBack,
+            engaged: this._dragEngaged,
             dropWasNoop: !!this._dropWasNoop,
         });
         this._dropWasNoop = false;
@@ -1800,13 +1808,6 @@ export default class SpatialOverviewExtension extends Extension {
         if (this._restoreIdleId) {
             GLib.source_remove(this._restoreIdleId);
             this._restoreIdleId = 0;
-        }
-    }
-
-    _removeEngageTimeout() {
-        if (this._engageTimeoutId) {
-            GLib.source_remove(this._engageTimeoutId);
-            this._engageTimeoutId = 0;
         }
     }
 
