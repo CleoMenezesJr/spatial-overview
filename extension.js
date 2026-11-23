@@ -102,46 +102,38 @@ function useMotion() {
     return St.Settings.get().reducedMotion !== St.ReducedMotion.REDUCE;
 }
 
-// The gap only ever opens where a drop can create a workspace
-// (_getInsertWorkspaceIndex).
-function rowGapReserve() {
-    return Meta.prefs_get_dynamic_workspaces() ? ROW_GAP_OPEN : 0;
+// Room kept off the row, split between its two ends, so the drawn row ends
+// WORKSPACE_REST_GAP from the monitor edge - the same empty space that
+// separates two workspaces. The actor reaches inset further than what is
+// drawn, so only the difference is reserved. The half of ROW_GAP_WIDTH the
+// end workspace moves when a gap opens fits inside it.
+function rowEndReserve(inset) {
+    return 2 * Math.max(WORKSPACE_REST_GAP - inset, 0);
 }
 
 // Scale and spacing of the fit-all row. wsSize is a workspace's width,
 // margin the offset that centres a row that fits, and extent the row's
 // length - more than avail once MIN_WS_SCALE no longer fits, which is when
-// the row scrolls. rowGapReserve() is kept off the row and split between its
-// two ends: the room _setRowGap parts the row into.
+// the row scrolls. rowEndReserve() is kept off the row's two ends.
 //
 // inset is how far the drawn background sits inside the Workspace actor on
 // each side (_collectWorkspaceRects measures it): the gaps are counted
 // between what is drawn, so the actors themselves may overlap.
 function computeFitAll(avail, n, portholeSize, spacing, inset = 0) {
     const fullAvail = avail;
-    avail -= rowGapReserve();
+    avail -= rowEndReserve(inset);
     // idealScale: the largest scale whose workspaces and gaps still fit,
     // from avail = n * wsSize + (n - 1) * gap(wsSize).
     const fixedGap = WORKSPACE_REST_GAP - 2 * inset * (1 + ACCENT_OVERHANG);
     const idealScale = (avail - (n - 1) * fixedGap) /
         (portholeSize * (n + (n - 1) * ACCENT_OVERHANG));
 
-    let scale = Math.min(idealScale, 1.0);
-
-    // Blend idealScale toward MIN_WS_SCALE over the workspaces past a
-    // threshold, so the row reaches the floor gradually.
-    const SPRING_THRESHOLD = 4;
-    if (n > SPRING_THRESHOLD) {
-        const t = Math.min((n - SPRING_THRESHOLD) / SPRING_THRESHOLD, 1.0);
-        const sprung = idealScale * (1 - t) + MIN_WS_SCALE * t;
-        scale = Math.min(scale, sprung);
-    }
-    scale = Math.max(scale, MIN_WS_SCALE);
+    const scale = Math.max(Math.min(idealScale, 1.0), MIN_WS_SCALE);
 
     const wsSize = Math.round(portholeSize * scale);
 
-    // Whatever the scale caps (at 1.0) or springs away goes to the margins,
-    // not to the gaps, so every gap is the same insert zone.
+    // What the cap at 1.0 leaves over goes to the margins, not to the gaps,
+    // so every gap is the same insert zone.
     const adjSpacing = n > 1
         ? WORKSPACE_REST_GAP - 2 * inset +
             ACCENT_OVERHANG * (wsSize - 2 * inset)
@@ -487,7 +479,7 @@ export default class SpatialOverviewExtension extends Extension {
                         adjSpacing * (nWorkspaces - 1))) / 2, 0);
             }
 
-            const overflow = Math.max(extent + rowGapReserve() - width, 0);
+            const overflow = Math.max(extent + rowEndReserve(self._wsInset) - width, 0);
             self._rowOverflow = overflow;
             self._rowStep = rowW + adjSpacing;
             self._rowWsW = rowW;
@@ -504,7 +496,7 @@ export default class SpatialOverviewExtension extends Extension {
                         ? nWorkspaces - 1 - active
                         : active;
                     const centred = slot * self._rowStep + wsW / 2 +
-                        rowGapReserve() / 2 - width / 2;
+                        rowEndReserve(self._wsInset) / 2 - width / 2;
                     // Centred, then brought to where a scroll to the left
                     // would land: the workspace cut by the left edge comes
                     // fully on screen and the one before it peeks in.
@@ -512,7 +504,7 @@ export default class SpatialOverviewExtension extends Extension {
                         self._alignedRowScroll(centred, -1), 0, overflow);
                 }
                 self._rowScroll = Math.clamp(self._rowScroll, 0, overflow);
-                x1 = rowGapReserve() / 2 - self._rowScroll;
+                x1 = rowEndReserve(self._wsInset) / 2 - self._rowScroll;
             }
 
             const fitAllBox = new Clutter.ActorBox();
@@ -1341,7 +1333,7 @@ export default class SpatialOverviewExtension extends Extension {
     // spacing (workspacesView.js:373-388) and a vfunc cannot be replaced from
     // an extension, so the row parts by translation instead: the workspaces
     // before the gap move back by half of it and the ones after move on by
-    // half. The layout keeps ROW_GAP_OPEN off the row (rowGapReserve), so
+    // half. The layout keeps room off the row's ends (rowEndReserve), so
     // either half fits in the margin at its end - without it a row that fills
     // the monitor pushes its end workspaces off screen.
     //
@@ -1468,7 +1460,7 @@ export default class SpatialOverviewExtension extends Extension {
     _alignedRowScroll(scroll, direction) {
         const {_rowStep: step, _rowWsW: wsW, _rowN: n, _rowWidth: width} = this;
         const peek = rowPreviewWidth(width);
-        const at = s => rowGapReserve() / 2 + s * step - scroll;
+        const at = s => rowEndReserve(this._wsInset) / 2 + s * step - scroll;
         if (direction > 0) {
             let s = 0;
             while (s < n && at(s) + wsW <= width + 0.5)
