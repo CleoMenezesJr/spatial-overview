@@ -30,16 +30,18 @@ const ZOOM_IN_DURATION = 400;
 const ZOOM_IN_ACTIVATE_DURATION = 200;
 const ZOOM_OUT_HOLD_DELAY = 150;
 const MIN_WS_SCALE = 0.18;
-// Gap between fit-all workspaces, as a fraction of a workspace's own size.
-// Upstream's ALL-mode spacing is a flat WORKSPACE_MIN_SPACING (24px,
-// workspacesView.js:22,225) that does not follow the shrinking workspaces.
-const WORKSPACE_GAP_RATIO = 0.006;
 // Upstream emphasises the current workspace by shrinking every other one to
 // WORKSPACE_INACTIVE_SCALE (0.94, workspacesView.js:25). Same 6% difference,
 // anchored the other way round: the row sits at 1 and the current one grows,
 // so the emphasis spends the gap instead of leaving a hole beside every panel.
 const WORKSPACE_ACTIVE_SCALE = 1.06;
-const WORKSPACE_CUT_SIZE = 10; // workspaceThumbnail.js:27
+// The empty space left between fit-all workspaces, which is also exactly
+// the zone that inserts a new one: upstream's own ALL-mode floor,
+// WORKSPACE_MIN_SPACING (workspacesView.js:22,225). The row's spacing adds
+// what the current workspace grows into on one side, so the gap beside it
+// stays this wide too.
+const WORKSPACE_REST_GAP = 24;
+const ACCENT_OVERHANG = (WORKSPACE_ACTIVE_SCALE - 1) / 2;
 const MIN_WORKSPACES = 3;
 const WORKSPACE_DOT_DURATION = 500; // panel.js:114,125
 // FIXME downstream: the active pill is one WorkspaceDot widened by
@@ -68,15 +70,93 @@ const WORKSPACE_DOT_WIDTH_PLATEAU = 2;
 const HOT_EDGE_WIDTH_FRACTION = 1 / 3;
 const PLACEHOLDER_WIDTH = 24;
 const PLACEHOLDER_MARGIN = 12;
-// How far the row parts around the placeholder.
-const ROW_GAP_WIDTH = PLACEHOLDER_WIDTH + 2 * PLACEHOLDER_MARGIN;
-const ROW_GAP_DURATION = 250;
+// The room an open gap gives the placeholder.
+const ROW_GAP_OPEN = PLACEHOLDER_WIDTH + 2 * PLACEHOLDER_MARGIN;
+// How far the row parts, on top of the resting gap, to reach that room.
+const ROW_GAP_WIDTH = ROW_GAP_OPEN - WORKSPACE_REST_GAP;
+const ROW_GAP_DURATION = 200;
+// appDisplay.js:55 waits DELAYED_MOVE_TIMEOUT (200ms) before reflowing the
+// grid. Here the gap's own ROW_GAP_DURATION follows the wait, and 200ms
+// before it read as slow in testing; so did 100ms.
+const ROW_GAP_DELAY = 80;
+// Bumping the pointer against the monitor edge scrolls the row by one
+// workspace and repeats while it stays there - the app grid's page switch
+// (appDisplay.js:50-53, 850-899) with its timing (iconGrid.js:13).
+const ROW_BUMP_THRESHOLD = 20;
+const ROW_BUMP_REPEAT_TIMEOUT = 1000;
+const ROW_SCROLL_DURATION = 300;
+// The app grid keeps PAGE_PREVIEW_RATIO of its neighbouring pages in view
+// (appDisplay.js:48).
+const ROW_PREVIEW_RATIO = 0.20;
 
-const ZoomOutView = GObject.registerClass({
-    Signals: {
-        'workspace-activated': {param_types: [GObject.TYPE_INT]},
-    },
-}, class ZoomOutView extends St.Widget {
+// How much of the neighbour peeks in at an edge the row can scroll to: half
+// of PAGE_PREVIEW_RATIO per side, as _getIndicatorsWidth gives the app grid
+// (appDisplay.js:221-236).
+function rowPreviewWidth(width) {
+    return Math.round(width * ROW_PREVIEW_RATIO / 2);
+}
+
+// The upstream reading of the reduced-motion setting: movement goes, fades
+// stay (boxpointer.js:86-87,150-153; windowManager.js:1171-1174).
+function useMotion() {
+    return St.Settings.get().reducedMotion !== St.ReducedMotion.REDUCE;
+}
+
+// The gap only ever opens where a drop can create a workspace
+// (_getInsertWorkspaceIndex).
+function rowGapReserve() {
+    return Meta.prefs_get_dynamic_workspaces() ? ROW_GAP_OPEN : 0;
+}
+
+// Scale and spacing of the fit-all row. wsSize is a workspace's width,
+// margin the offset that centres a row that fits, and extent the row's
+// length - more than avail once MIN_WS_SCALE no longer fits, which is when
+// the row scrolls. rowGapReserve() is kept off the row and split between its
+// two ends: the room _setRowGap parts the row into.
+//
+// inset is how far the drawn background sits inside the Workspace actor on
+// each side (_collectWorkspaceRects measures it): the gaps are counted
+// between what is drawn, so the actors themselves may overlap.
+function computeFitAll(avail, n, portholeSize, spacing, inset = 0) {
+    const fullAvail = avail;
+    avail -= rowGapReserve();
+    // idealScale: the largest scale whose workspaces and gaps still fit,
+    // from avail = n * wsSize + (n - 1) * gap(wsSize).
+    const fixedGap = WORKSPACE_REST_GAP - 2 * inset * (1 + ACCENT_OVERHANG);
+    const idealScale = (avail - (n - 1) * fixedGap) /
+        (portholeSize * (n + (n - 1) * ACCENT_OVERHANG));
+
+    let scale = Math.min(idealScale, 1.0);
+
+    // Blend idealScale toward MIN_WS_SCALE over the workspaces past a
+    // threshold, so the row reaches the floor gradually.
+    const SPRING_THRESHOLD = 4;
+    if (n > SPRING_THRESHOLD) {
+        const t = Math.min((n - SPRING_THRESHOLD) / SPRING_THRESHOLD, 1.0);
+        const sprung = idealScale * (1 - t) + MIN_WS_SCALE * t;
+        scale = Math.min(scale, sprung);
+    }
+    scale = Math.max(scale, MIN_WS_SCALE);
+
+    const wsSize = Math.round(portholeSize * scale);
+
+    // Whatever the scale caps (at 1.0) or springs away goes to the margins,
+    // not to the gaps, so every gap is the same insert zone.
+    const adjSpacing = n > 1
+        ? WORKSPACE_REST_GAP - 2 * inset +
+            ACCENT_OVERHANG * (wsSize - 2 * inset)
+        : spacing;
+
+    // vfunc_allocate steps by wsSize + adjSpacing (workspacesView.js:380-387),
+    // so this is the row's real extent.
+    const extent = wsSize * n + adjSpacing * (n - 1);
+    const margin = Math.max((fullAvail - extent) / 2, 0);
+
+    return {scale, wsSize, adjSpacing, margin, extent};
+}
+
+const ZoomOutView = GObject.registerClass(
+class ZoomOutView extends St.Widget {
     _init() {
         super._init({
             reactive: true,
@@ -107,7 +187,7 @@ const ZoomOutView = GObject.registerClass({
             y: 0,
         });
         this._dropPlaceholder.set_pivot_point(0.5, 0.5);
-        this._placeholderLeaving = false;
+
         this._dropPlaceholderRect = null; // { index, x, y, w, h } in ZoomOutView local coords
         this.add_child(this._dropPlaceholder);
     }
@@ -124,7 +204,7 @@ const ZoomOutView = GObject.registerClass({
 
             this._placeholderLeaving = false;
             ph.remove_all_transitions();
-            ph.set({visible: true, opacity: 0, scale_y: 0});
+            ph.set({visible: true, opacity: 0, scale_y: useMotion() ? 0 : 1});
             ph.ease({
                 opacity: 255,
                 scale_y: 1,
@@ -139,7 +219,7 @@ const ZoomOutView = GObject.registerClass({
         this._placeholderLeaving = true;
         ph.ease({
             opacity: 0,
-            scale_y: 0,
+            scale_y: useMotion() ? 0 : 1,
             duration: ROW_GAP_DURATION,
             mode: Clutter.AnimationMode.EASE_OUT_CUBIC,
             onStopped: finished => {
@@ -215,9 +295,15 @@ const ZoomOutView = GObject.registerClass({
             const rect =
                 this._extension._getInsertRect(insertIndex);
             if (rect) {
-                this._extension._dropInsertIndex = insertIndex;
-                this.setDropPlaceholderRect(rect);
-                this._extension._setRowGap(insertIndex);
+                const ext = this._extension;
+                if (ext._dropInsertIndex !== insertIndex)
+                    ext._clearDragPlaceholder();
+                ext._dropInsertIndex = insertIndex;
+                // Already open: the rects move with the zoom, so follow them.
+                if (ext._rowGapIndex === insertIndex)
+                    this.setDropPlaceholderRect(rect);
+                else
+                    ext._queueRowGap(insertIndex);
                 logTime('VIEW.handleDragOver => INSERT',
                     {insertIndex, x, y, rect});
                 return isWindow
@@ -264,6 +350,18 @@ export default class SpatialOverviewExtension extends Extension {
         this._dropInsertIndex = -1;
         this._dropWorkspaceIndex = -1;
         this._rowGapIndex = -1;
+        this._rowGapTimeoutId = 0;
+        this._rowGapPending = -1;
+        this._rowScroll = null;
+        this._rowOverflow = 0;
+        this._rowStep = 0;
+        this._rowScrollAdj = null;
+        this._rowBumpTimeoutId = 0;
+        this._rowBumpX = -1;
+        this._rowWsW = 0;
+        this._rowN = 0;
+        this._rowWidth = 0;
+        this._wsInset = 0;
         this._sessionModeUpdatedId = 0;
         this._minWorkspacesProto = null;
         this._panelPatched = false;
@@ -328,9 +426,15 @@ export default class SpatialOverviewExtension extends Extension {
     // bounded. Ideal upstream fix: add a min-scale property to
     // WorkspacesView or share the ThumbnailsBox scaling model.
     //
+    // Past the floor the row runs off the monitor instead of shrinking
+    // further, and _rowScroll says which part of it is on screen.
+    //
     // Both _getSpacing AND _getFirstFitAllWorkspaceBox are patched: the former
     // controls the per-step advance in vfunc_allocate's loop, the latter
     // controls the initial box origin + size. They must agree on spacing.
+    //
+    // Horizontal rows only: a vertical one (workspacesView.js:337) is left to
+    // upstream, and _engageSpatialLayout does not engage for it.
     _patchFitAllLayout() {
         if (this._fitAllPatched)
             return;
@@ -340,154 +444,87 @@ export default class SpatialOverviewExtension extends Extension {
         const origGetSpacing = this._origGetSpacing;
         const self = this;
 
-        // Shared helper: computes scale + adjusted spacing for FitMode.ALL.
-        // Returns {scale, wsSize, adjSpacing, margin} where wsSize is the
-        // workspace width (horizontal) or height (vertical), and margin is
-        // the offset that centers the row.
-        //
-        // reserve is width kept off the row and split between its two ends:
-        // the room _setRowGap parts the row into.
-        const _computeFitAll = (avail, n, portholeSize, spacing, reserve) => {
-            const fullAvail = avail;
-            avail -= reserve;
-            // idealScale: the largest scale whose workspaces plus their own
-            // proportional gaps still fit, from
-            // avail = n * wsSize + (n + 1) * WORKSPACE_GAP_RATIO * wsSize.
-            // Upstream instead subtracts a flat spacing (24px at the ALL-mode
-            // clamp), which stays put while the workspaces shrink.
-            const idealScale =
-                avail / (portholeSize * (n + WORKSPACE_GAP_RATIO * (n + 1)));
-
-            // With proportional scaling, we want workspaces to shrink
-            // gracefully: transition from idealScale toward MIN_WS_SCALE as n
-            // grows, but never exceed idealScale (so few-workspaces layout is
-            // preserved) and never go below MIN_WS_SCALE unless the row cannot
-            // hold them at that size.
-            let scale = Math.min(idealScale, 1.0);
-
-            // Spring toward MIN_WS_SCALE: blend idealScale with MIN_WS_SCALE
-            // proportional to how many workspaces beyond a threshold.
-            // This makes spacing shrink BEFORE hitting zero.
-            const SPRING_THRESHOLD = 4;
-            if (n > SPRING_THRESHOLD) {
-                const t = Math.min((n - SPRING_THRESHOLD) / SPRING_THRESHOLD, 1.0);
-                const sprung = idealScale * (1 - t) + MIN_WS_SCALE * t;
-                scale = Math.min(scale, sprung);
-            }
-            scale = Math.max(scale, MIN_WS_SCALE);
-
-            // Hard floor: past ~6 workspaces MIN_WS_SCALE asks for more room
-            // than the row has, and idealScale is by construction the largest
-            // scale that still fits with its gaps. Filling the row edge to
-            // edge instead would trade the whole gap budget for under 1% of
-            // size, and read as one wide workspace rather than several.
-            scale = Math.min(scale, idealScale);
-
-            const wsSize = Math.round(portholeSize * scale);
-
-            // Spacing absorbs leftover space, but only up to its share of the
-            // workspace it separates. Without the cap every pixel the scale
-            // caps (at 1.0), springs or floors away comes back as gap, so the
-            // emptier the row the wider its holes.
-            let adjSpacing;
-            if (n > 1) {
-                const leftover = avail - wsSize * n;
-                adjSpacing = Math.min(Math.max(leftover / (n + 1), 0),
-                    WORKSPACE_GAP_RATIO * wsSize);
-            } else {
-                adjSpacing = spacing;
-            }
-
-            // What the gaps did not absorb goes to the ends. vfunc_allocate
-            // steps by wsSize + adjSpacing (workspacesView.js:380-387), so
-            // this is the row's real extent.
-            const margin = Math.max(
-                (fullAvail - (wsSize * n + adjSpacing * (n - 1))) / 2, 0);
-
-            return {scale, wsSize, adjSpacing, margin};
-        };
-
-        // The gap only ever opens along a horizontal row, and only where a
-        // drop can create a workspace (_getInsertWorkspaceIndex).
-        const rowGapReserve = vertical =>
-            !vertical && Meta.prefs_get_dynamic_workspaces() ? ROW_GAP_WIDTH : 0;
-
         proto._getSpacing = function (box, fitMode, vertical) {
-            if (fitMode !== FitMode.ALL || !self._spatialLayoutActive())
+            if (fitMode !== FitMode.ALL || vertical ||
+                !self._spatialLayoutActive())
                 return origGetSpacing.call(this, box, fitMode, vertical);
 
-            const [width, height] = box.get_size();
-            const {nWorkspaces} = global.workspaceManager;
-
+            const [width] = box.get_size();
             const workarea = Main.layoutManager.getWorkAreaForMonitor(
                 this._monitorIndex);
-            const portholeW = workarea?.width ?? width;
-            const portholeH = workarea?.height ?? height;
-
-            // Start from upstream's spacing value for ALL mode.
-            const upstream = origGetSpacing.call(this, box, fitMode, vertical);
-
-            const avail = vertical ? height : width;
-            const portholeSize = vertical ? portholeH : portholeW;
-            const {adjSpacing} = _computeFitAll(avail, nWorkspaces,
-                portholeSize, upstream, rowGapReserve(vertical));
+            const {adjSpacing} = computeFitAll(width,
+                global.workspaceManager.nWorkspaces,
+                workarea?.width ?? width,
+                origGetSpacing.call(this, box, fitMode, vertical),
+                self._wsInset);
             return adjSpacing;
         };
 
         proto._getFirstFitAllWorkspaceBox = function (box, spacing, vertical) {
-            if (!self._spatialLayoutActive())
-                return self._origGetFirstFitAllWorkspaceBox.call(this, box, spacing, vertical);
+            if (vertical || !self._spatialLayoutActive()) {
+                return self._origGetFirstFitAllWorkspaceBox.call(
+                    this, box, spacing, vertical);
+            }
 
             const {nWorkspaces} = global.workspaceManager;
             const [width, height] = box.get_size();
             const [workspace] = this._workspaces;
-
-            const fitAllBox = new Clutter.ActorBox();
-            let [x1, y1] = box.get_origin();
-
             const workarea = Main.layoutManager.getWorkAreaForMonitor(
                 this._monitorIndex);
             const portholeW = workarea?.width ?? width;
-            const portholeH = workarea?.height ?? height;
 
-            let gap = 0;
-            if (vertical) {
-                const {wsSize: wsH, adjSpacing, margin} = _computeFitAll(
-                    height, nWorkspaces, portholeH, spacing,
-                    rowGapReserve(vertical));
-                gap = adjSpacing;
-                y1 = margin;
-                const [, wsW] = workspace.get_preferred_width(wsH);
-                if (wsW > width) {
-                    const [, realH] = workspace.get_preferred_height(width);
-                    y1 = Math.max(
-                        (height - (realH * nWorkspaces +
-                            adjSpacing * (nWorkspaces - 1))) / 2, 0);
-                }
-                fitAllBox.set_size(width, wsH);
-            } else {
-                const {wsSize: wsW, adjSpacing, margin} = _computeFitAll(
-                    width, nWorkspaces, portholeW, spacing,
-                    rowGapReserve(vertical));
-                gap = adjSpacing;
-                x1 = margin;
-                const [, wsH] = workspace.get_preferred_height(wsW);
-                if (wsH > height) {
-                    const [, realW] = workspace.get_preferred_width(height);
-                    x1 = Math.max(
-                        (width - (realW * nWorkspaces +
-                            adjSpacing * (nWorkspaces - 1))) / 2, 0);
-                }
-                fitAllBox.set_size(wsW, height);
+            const {wsSize: wsW, adjSpacing, margin, extent} =
+                computeFitAll(width, nWorkspaces, portholeW, spacing,
+                    self._wsInset);
+            let x1 = margin;
+            let rowW = wsW;
+            const [, wsH] = workspace.get_preferred_height(wsW);
+            if (wsH > height) {
+                const [, realW] = workspace.get_preferred_width(height);
+                rowW = realW;
+                x1 = Math.max(
+                    (width - (realW * nWorkspaces +
+                        adjSpacing * (nWorkspaces - 1))) / 2, 0);
             }
 
-            fitAllBox.set_origin(x1, y1);
+            const overflow = Math.max(extent + rowGapReserve() - width, 0);
+            self._rowOverflow = overflow;
+            self._rowStep = rowW + adjSpacing;
+            self._rowWsW = rowW;
+            self._rowN = nWorkspaces;
+            self._rowWidth = width;
+            if (overflow > 0) {
+                // The first allocation of an engage centres the current
+                // workspace; vfunc_allocate lays the row out reversed under
+                // RTL (workspacesView.js:353-356).
+                if (self._rowScroll === null) {
+                    const active =
+                        global.workspaceManager.get_active_workspace_index();
+                    const slot = this.text_direction === Clutter.TextDirection.RTL
+                        ? nWorkspaces - 1 - active
+                        : active;
+                    const centred = slot * self._rowStep + wsW / 2 +
+                        rowGapReserve() / 2 - width / 2;
+                    // Centred, then brought to where a scroll to the left
+                    // would land: the workspace cut by the left edge comes
+                    // fully on screen and the one before it peeks in.
+                    self._rowScroll = Math.clamp(
+                        self._alignedRowScroll(centred, -1), 0, overflow);
+                }
+                self._rowScroll = Math.clamp(self._rowScroll, 0, overflow);
+                x1 = rowGapReserve() / 2 - self._rowScroll;
+            }
+
+            const fitAllBox = new Clutter.ActorBox();
+            fitAllBox.set_origin(x1, box.get_origin()[1]);
+            fitAllBox.set_size(wsW, height);
 
             logTime('fitAllLayout', JSON.stringify({
                 n: nWorkspaces,
-                scale: (fitAllBox.get_size()[0] / portholeW).toFixed(3),
-                wsW: fitAllBox.get_size()[0], gap: Math.round(gap),
+                scale: (wsW / portholeW).toFixed(3),
+                wsW, gap: Math.round(adjSpacing),
                 x1: Math.round(x1), portholeW,
+                overflow: Math.round(overflow),
             }));
 
             return fitAllBox;
@@ -702,6 +739,10 @@ export default class SpatialOverviewExtension extends Extension {
         this._disconnectFitModeNotify();
         this._removeRestoreIdle();
         this._removeEngageTimeout();
+        this._removeRowGapTimeout();
+        this._resetRowBump();
+        this._rowScrollAdj?.remove_transition('value');
+        this._rowScrollAdj = null;
         this._stopSnapBackRetarget();
         this._spatialEngaged = false;
         this._restoreWorkspacesState();
@@ -726,8 +767,6 @@ export default class SpatialOverviewExtension extends Extension {
         const self = this;
         this._draggedMetaWindow = metaWindow;
 
-        this._lastCursorX = 0;
-        this._lastCursorY = 0;
         this._dragMotionCount = 0;
         this._activeDraggable = null;
         this._dropInsertIndex = -1;
@@ -865,8 +904,7 @@ export default class SpatialOverviewExtension extends Extension {
                         draggable.disconnect(restoreId);
                     });
                 }
-                this._lastCursorX = dragEvent.x;
-                this._lastCursorY = dragEvent.y;
+                this._maybeScrollRow(dragEvent.x);
                 this._dragMotionCount++;
                 if (this._dragMotionCount % 10 === 1)
                     logTime('dragMotion', {
@@ -897,8 +935,16 @@ export default class SpatialOverviewExtension extends Extension {
     }
 
     _engageSpatialLayout() {
+        // The hit test, the gap and the scroll are laid along a horizontal
+        // row; see _patchFitAllLayout.
+        if (global.workspace_manager.layout_rows === -1) {
+            logTime('_engageSpatialLayout: vertical layout, not engaging');
+            return;
+        }
         logTime('_engageSpatialLayout ENTER (zoom-out will start)');
         const self = this;
+        this._rowScroll = null;
+        this._measureWorkspaceInset();
 
         const controls = this._getControls();
         if (controls) {
@@ -958,8 +1004,8 @@ export default class SpatialOverviewExtension extends Extension {
             // Keep the emphasis, drop the hole: put the row at 1 and grow the
             // current workspace instead, reusing upstream's own scaleProgress
             // so the accent still hands over smoothly as the scroll position
-            // moves. What it grows into is the gap, not reserved space, so it
-            // has to be drawn above its neighbours.
+            // moves. What it grows into is reserved in the row's spacing
+            // (computeFitAll), and it is drawn above its neighbours.
             //
             // Ideal upstream fix: make the emphasis grow the current workspace
             // rather than shrink the rest, so a row that shows every workspace
@@ -1129,7 +1175,6 @@ export default class SpatialOverviewExtension extends Extension {
         });
         if (!metaWindow) {
             logTime('_handleDrop: NO metaWindow -> skip');
-            this._dropWasNoop = true;
             this._clearDragPlaceholder();
             return false;
         }
@@ -1154,14 +1199,12 @@ export default class SpatialOverviewExtension extends Extension {
 
         if (wsIndex < 0) {
             logTime('_handleDrop: outside any workspace -> skip (no anim)');
-            this._dropWasNoop = true;
             return false;
         }
         const targetWs = global.workspace_manager.get_workspace_by_index(wsIndex);
         const currentWs = metaWindow.get_workspace();
         if (currentWs === targetWs) {
             logTime('_handleDrop: same workspace -> skip (no anim)');
-            this._dropWasNoop = true;
             return false;
         }
         logTime('_handleDrop: change_workspace CALLED', {
@@ -1248,8 +1291,47 @@ export default class SpatialOverviewExtension extends Extension {
             return;
 
         this._dropInsertIndex = -1;
+        this._removeRowGapTimeout();
         this._zoomOutView?.setDropPlaceholderRect(null);
         this._setRowGap(-1);
+    }
+
+    // FIXME downstream: ThumbnailsBox opens its placeholder on the first
+    // hover pass (workspaceThumbnail.js:870-873), so a pointer only passing
+    // over a gap opens and closes it on the way. The app grid already holds
+    // back the same kind of reflow: an icon dragged over the grid moves the
+    // others only once the pointer has rested on one position for
+    // DELAYED_MOVE_TIMEOUT, and moving on restarts the wait
+    // (appDisplay.js:55, 764-806). Same rule here. As in the app grid, the
+    // delay is only what is shown: a drop in the zone inserts either way,
+    // because handleDragOver has already recorded it.
+    //
+    // Ideal upstream fix: the same delay in ThumbnailsBox.handleDragOver.
+    _queueRowGap(insertIndex) {
+        if (this._rowGapTimeoutId && this._rowGapPending === insertIndex)
+            return;
+
+        this._removeRowGapTimeout();
+        this._rowGapPending = insertIndex;
+        this._rowGapTimeoutId = GLib.timeout_add(
+            GLib.PRIORITY_DEFAULT, ROW_GAP_DELAY, () => {
+                this._rowGapTimeoutId = 0;
+                if (this._dropInsertIndex === insertIndex) {
+                    logTime('row gap opens', {insertIndex});
+                    this._setRowGap(insertIndex);
+                    this._zoomOutView?.setDropPlaceholderRect(
+                        this._getInsertRect(insertIndex));
+                }
+                return GLib.SOURCE_REMOVE;
+            });
+    }
+
+    _removeRowGapTimeout() {
+        if (this._rowGapTimeoutId) {
+            GLib.source_remove(this._rowGapTimeoutId);
+            this._rowGapTimeoutId = 0;
+        }
+        this._rowGapPending = -1;
     }
 
     // FIXME downstream: ThumbnailsBox opens room for its placeholder by
@@ -1259,12 +1341,13 @@ export default class SpatialOverviewExtension extends Extension {
     // spacing (workspacesView.js:373-388) and a vfunc cannot be replaced from
     // an extension, so the row parts by translation instead: the workspaces
     // before the gap move back by half of it and the ones after move on by
-    // half. The layout keeps ROW_GAP_WIDTH off the row (rowGapReserve), so
+    // half. The layout keeps ROW_GAP_OPEN off the row (rowGapReserve), so
     // either half fits in the margin at its end - without it a row that fills
     // the monitor pushes its end workspaces off screen.
     //
-    // The hit test reads the row without this translation
-    // (_collectWorkspaceRects), so the zones never move with the animation.
+    // The hit test reads the row without this translation and adds the
+    // offset it is heading for (_collectWorkspaceRects, _rowGapOffset), so the
+    // zones never move with the animation.
     //
     // Ideal upstream fix: let the fit-all loop in vfunc_allocate leave room
     // at a given index, the way ThumbnailsBox consults _dropPlaceholderPos.
@@ -1273,17 +1356,137 @@ export default class SpatialOverviewExtension extends Extension {
             return;
         this._rowGapIndex = insertIndex;
 
+        const forward = this._rowIsRtl() ? -1 : 1;
+        const duration = useMotion() ? ROW_GAP_DURATION : 0;
         for (const w of this._getFitAllWorkspaces()) {
             const i = w.metaWorkspace?.index() ?? -1;
             const offset = insertIndex < 0
                 ? 0
-                : (i >= insertIndex ? 1 : -1) * ROW_GAP_WIDTH / 2;
+                : forward * (i >= insertIndex ? 1 : -1) * ROW_GAP_WIDTH / 2;
             w.ease({
                 translation_x: offset,
-                duration: ROW_GAP_DURATION,
+                duration,
                 mode: Clutter.AnimationMode.EASE_OUT_CUBIC,
             });
         }
+    }
+
+    _ensureRowScrollAdjustment() {
+        if (this._rowScrollAdj || !this._zoomOutView)
+            return this._rowScrollAdj;
+
+        this._rowScrollAdj = new St.Adjustment({
+            actor: this._zoomOutView,
+            lower: 0,
+            upper: 1,
+        });
+        // Same reason as the fitMode re-pick in _engageSpatialLayout: the
+        // scroll slides drop targets under a still pointer.
+        this._rowScrollAdj.connect('notify::value', adj => {
+            if (!this._spatialLayoutActive())
+                return;
+            this._rowScroll = adj.value;
+            for (const view of this._getWsDisplay()?._workspacesViews ?? [])
+                view.queue_relayout();
+            this._revalidateDragHover();
+        });
+        return this._rowScrollAdj;
+    }
+
+    _scrollRowBy(direction) {
+        const adj = this._ensureRowScrollAdjustment();
+        if (!adj || !(this._rowOverflow > 0) || this._rowScroll === null)
+            return;
+
+        const target = Math.clamp(
+            this._alignedRowScroll(this._rowScroll, direction),
+            0, this._rowOverflow);
+        if (target === this._rowScroll)
+            return;
+
+        logTime('row scroll', {from: Math.round(this._rowScroll),
+            to: Math.round(target), overflow: Math.round(this._rowOverflow)});
+        adj.remove_transition('value');
+        adj.upper = this._rowOverflow;
+        adj.value = this._rowScroll;
+        adj.ease(target, {
+            duration: ROW_SCROLL_DURATION,
+            mode: Clutter.AnimationMode.EASE_OUT_CUBIC,
+        });
+    }
+
+    _resetRowBump() {
+        if (this._rowBumpTimeoutId) {
+            GLib.source_remove(this._rowBumpTimeoutId);
+            this._rowBumpTimeoutId = 0;
+        }
+        this._rowBumpX = -1;
+    }
+
+    // AppDisplay._dragMaybeSwitchPageImmediately (appDisplay.js:850-899) for
+    // the fit-all row, scrolling by a workspace where it turns a page, and
+    // repeating while the pointer stays. Like upstream it is off with more
+    // than one monitor, where the same push carries the window to the next
+    // one.
+    _maybeScrollRow(x) {
+        const mon = Main.layoutManager.primaryMonitor;
+        if (!this._spatialLayoutActive() || !(this._rowOverflow > 0) ||
+            !mon || Main.layoutManager.monitors.length > 1) {
+            this._resetRowBump();
+            return;
+        }
+        if (this._rowScrollAdj?.get_transition('value'))
+            return;
+
+        const start = mon.x + ROW_BUMP_THRESHOLD;
+        const end = mon.x + mon.width - ROW_BUMP_THRESHOLD;
+        if (x > start && x < end) {
+            if (this._rowBumpX >= 0 &&
+                Math.abs(this._rowBumpX - x) > ROW_BUMP_THRESHOLD)
+                this._resetRowBump();
+            return;
+        }
+        if (this._rowBumpX >= 0)
+            return;
+
+        const direction = x <= start ? -1 : 1;
+        this._scrollRowBy(direction);
+        this._resetRowBump();
+        this._rowBumpTimeoutId = GLib.timeout_add(
+            GLib.PRIORITY_DEFAULT, ROW_BUMP_REPEAT_TIMEOUT, () => {
+                this._scrollRowBy(direction);
+                return GLib.SOURCE_CONTINUE;
+            });
+        this._rowBumpX = x;
+    }
+
+    // Where a scroll in `direction` (screen order) lands. Like the app grid,
+    // which always keeps PAGE_PREVIEW_RATIO of the neighbouring pages in view
+    // (appDisplay.js:48, 221-236), the workspace brought fully on screen
+    // leaves the next one peeking in by rowPreviewWidth - unless it is the
+    // end of the row, which needs no peek.
+    _alignedRowScroll(scroll, direction) {
+        const {_rowStep: step, _rowWsW: wsW, _rowN: n, _rowWidth: width} = this;
+        const peek = rowPreviewWidth(width);
+        const at = s => rowGapReserve() / 2 + s * step - scroll;
+        if (direction > 0) {
+            let s = 0;
+            while (s < n && at(s) + wsW <= width + 0.5)
+                s++;
+            if (s >= n)
+                return scroll;
+            if (s === n - 1)
+                return this._rowOverflow;
+            return scroll + at(s + 1) - (width - peek);
+        }
+        let s = n - 1;
+        while (s >= 0 && at(s) >= -0.5)
+            s--;
+        if (s < 0)
+            return scroll;
+        if (s === 0)
+            return 0;
+        return scroll + at(s - 1) + wsW - peek;
     }
 
     _resetRowGap() {
@@ -1367,6 +1570,7 @@ export default class SpatialOverviewExtension extends Extension {
             return;
         }
         this._dragActive = false;
+        this._resetRowBump();
         // Connected per engage, so it has to go per drag: the adjustment is the
         // shell's own and outlives us, and the next engage would connect a
         // second handler onto it rather than replace this one.
@@ -1379,9 +1583,7 @@ export default class SpatialOverviewExtension extends Extension {
             dragMotionTotal: this._dragMotionCount,
             isCancel,
             heldBack,
-            dropWasNoop: !!this._dropWasNoop,
         });
-        this._dropWasNoop = false;
 
         if (this._dragMonitor) {
             DND.removeDragMonitor(this._dragMonitor);
@@ -1928,14 +2130,13 @@ export default class SpatialOverviewExtension extends Extension {
             Main.layoutManager.primaryIndex];
         const view = this._zoomOutView;
         if (!mon || !view)
-            return {rects: [], monitor: null, spacing: 0};
+            return {rects: [], monitor: null};
 
         const workspaces = this._getFitAllWorkspaces();
         if (workspaces.length === 0)
-            return {rects: [], monitor: mon, spacing: 0};
+            return {rects: [], monitor: mon};
 
         const rects = [];
-        const rendered = [];
         for (const wsActor of workspaces) {
             if (!wsActor || !wsActor.visible || !wsActor.metaWorkspace)
                 continue;
@@ -1944,95 +2145,162 @@ export default class SpatialOverviewExtension extends Extension {
             if (ww <= 1 || wh <= 1)
                 continue;
 
-            // The row as the layout placed it, not as it is drawn: without
-            // the accent's scale, which grows the current workspace about its
-            // centre (workspace.js:1041), and without the translation
-            // _setRowGap parts the row with. Both are paint-time transforms,
-            // so the zones measured off the drawn geometry would move under a
-            // still cursor while they animate.
+            // Without the translation _setRowGap parts the row with: the
+            // zones below add the gap's target offset themselves, so they
+            // sit where the row is going rather than where the animation has
+            // it this frame. x/w keep the accent's scale - they are what is
+            // drawn - and bx/bw drop it (it grows the workspace about its
+            // centre, workspace.js:1041), which is where the gaps are laid.
             const scale = wsActor.scale_x || 1;
             const ancestorScale = ww / (wsActor.width * scale) || 1;
-            const cx = wx + ww / 2 -
-                wsActor.translation_x * ancestorScale;
+            const cx = wx + ww / 2 - wsActor.translation_x * ancestorScale;
             const cy = wy + wh / 2;
-            const bw = ww / scale;
-            const bh = wh / scale;
 
-            const [okTL, lx, ly] =
-                view.transform_stage_point(cx - bw / 2, cy - bh / 2);
-            const [okBR, rx, ry] =
-                view.transform_stage_point(cx + bw / 2, cy + bh / 2);
-            if (!okTL || !okBR)
+            // The target is the thumbnail as drawn - the background, which
+            // sits inside the actor by a fixed margin (measured: 20px on each
+            // side and 12px top and bottom, at every size from 248px to 826px
+            // wide), centred in it.
+            const [gw, gh] = this._drawnSize(wsActor, ww, wh);
+            this._wsInset = (ww - gw) / 2 / scale / ancestorScale;
+
+            const local = (sx, sy) => view.transform_stage_point(sx, sy);
+            const [ok1, x1] = local(cx - gw / 2, cy);
+            const [ok2, x2] = local(cx + gw / 2, cy);
+            const [ok3, bx1, by1] = local(cx - gw / scale / 2, cy - gh / scale / 2);
+            const [ok4, bx2, by2] = local(cx + gw / scale / 2, cy + gh / scale / 2);
+            if (!ok1 || !ok2 || !ok3 || !ok4)
                 continue;
             rects.push({
                 i: wsActor.metaWorkspace.index(),
-                x: Math.round(lx), y: Math.round(ly),
-                w: Math.round(rx - lx), h: Math.round(ry - ly),
+                x: x1, w: x2 - x1,
+                bx: bx1, bw: bx2 - bx1,
+                y: by1, h: by2 - by1,
             });
-            if (DEBUG)
-                rendered.push(Math.round(view.transform_stage_point(wx, wy)[1]));
+        }
+
+        // Under RTL vfunc_allocate lays the row out reversed
+        // (workspacesView.js:353-356) and ThumbnailsBox mirrors every zone
+        // (workspaceThumbnail.js:786-835). The rects are mirrored instead, so
+        // the zones below are written once, in reading order; the callers
+        // mirror the pointer on the way in and the placeholder on the way out.
+        const rtl = this._rowIsRtl();
+        if (rtl) {
+            const width = view.width;
+            for (const r of rects) {
+                r.x = width - (r.x + r.w);
+                r.bx = width - (r.bx + r.bw);
+            }
         }
         rects.sort((a, b) => a.i - b.i);
 
-        // Measured off the rects, not read from a theme node: our patched
-        // _getSpacing is what produced this layout.
-        const spacing = rects.length > 1
-            ? Math.max(0, rects[1].x - (rects[0].x + rects[0].w))
-            : 0;
-
         if (DEBUG) {
-            const key = rendered.join(',');
+            const key = rects.map(r => `${Math.round(r.x)}:${Math.round(r.w)}`).join(',');
             if (this._rectProbeKey !== key) {
                 this._rectProbeKey = key;
+                // What is drawn against what is measured: the Workspace actor
+                // is a BinLayout holding the background and the windows
+                // (workspace.js:1038-1060).
+                const extent = a => {
+                    if (!a)
+                        return null;
+                    const [x, y] = a.get_transformed_position();
+                    const [w, h] = a.get_transformed_size();
+                    return [x, y, w, h].map(Math.round);
+                };
+                const w0 = workspaces.find(w => w?.metaWorkspace);
+                logTime('wsGeom', JSON.stringify({
+                    actor: extent(w0),
+                    background: extent(w0?._background),
+                    bgActor: extent(w0?._background?._bgManager?.backgroundActor),
+                    container: extent(w0?._container),
+                    scale: w0?.scale_x,
+                }));
                 logTime('wsRects', JSON.stringify({
-                    n: rects.length, spacing,
-                    panel: rects[0] ? [rects[0].w, rects[0].h] : null,
-                    x: rects.map(r => r.x),
-                    rendered,
+                    n: rects.length,
+                    panel: rects[0] ? [Math.round(rects[0].bw), Math.round(rects[0].h)] : null,
+                    x: rects.map(r => Math.round(r.x)),
                     gaps: rects.slice(1).map(
-                        (r, k) => r.x - (rects[k].x + rects[k].w)),
+                        (r, k) => Math.round(r.x - (rects[k].x + rects[k].w))),
                 }));
             }
         }
 
-        return {rects, monitor: mon, spacing};
+        return {rects, monitor: mon, rtl};
     }
 
-    // The horizontal cut mirrors upstream _withinWorkspace
-    // (workspaceThumbnail.js:819-834): the outer WORKSPACE_CUT_SIZE of each
-    // workspace belongs to the neighbouring insert zone, not to the workspace.
-    // The last workspace keeps its outer edge, as upstream's does
-    // (workspaceThumbnail.js:826-831), and past it the drop goes to the spare
-    // workspace at the end of the row (_firstTrailingEmptyIndex).
-    _getWorkspaceIndexAt(x, y) {
-        const {rects, monitor} = this._collectWorkspaceRects();
-        if (!monitor || rects.length === 0) {
-            logTime('_getWorkspaceIndexAt: no rects', {
-                x: Math.round(x), y: Math.round(y),
-            });
-            return -1;
+    _drawnSize(wsActor, ww, wh) {
+        const [gw, gh] = wsActor._background?.get_transformed_size() ?? [];
+        return gw > 1 && gh > 1 ? [gw, gh] : [ww, wh];
+    }
+
+    // Read before the zoom, so the first fit-all layout already counts the
+    // gaps between what is drawn; afterwards _collectWorkspaceRects keeps it.
+    //
+    // Only from a workspace whose background has a size: the probe read 0x0
+    // for the background of a workspace sitting off screen at FitMode.SINGLE.
+    _measureWorkspaceInset() {
+        for (const w of this._getFitAllWorkspaces()) {
+            const [ww, wh] = w?.get_transformed_size() ?? [0, 0];
+            const [gw, gh] = w?._background?.get_transformed_size() ?? [0, 0];
+            if (!(ww > 1) || !(gw > 1) || !(gh > 1))
+                continue;
+            const scale = w.scale_x || 1;
+            const ancestorScale = ww / (w.width * scale) || 1;
+            this._wsInset = (ww - gw) / 2 / scale / ancestorScale;
+            logTime('workspace inset', {inset: Math.round(this._wsInset), wh});
+            return;
         }
-        const last = rects[rects.length - 1];
+        logTime('workspace inset: no drawn background to measure');
+    }
+
+    _rowIsRtl() {
+        return Clutter.get_default_text_direction() ===
+            Clutter.TextDirection.RTL;
+    }
+
+    // From ZoomOutView-local x to the reading-order x the rects are in.
+    _readingX(x, rtl) {
+        return rtl ? this._zoomOutView.width - x : x;
+    }
+
+    // Where _setRowGap is taking workspace i, in reading order.
+    _rowGapOffset(i) {
+        if (this._rowGapIndex < 0)
+            return 0;
+        return (i >= this._rowGapIndex ? 1 : -1) * ROW_GAP_WIDTH / 2;
+    }
+
+    // Horizontal extent of rect r as it is drawn once the gap has opened.
+    _visibleSpan(r) {
+        const x = r.x + this._rowGapOffset(r.i);
+        return [x, x + r.w];
+    }
+
+    _withinRow(rects, y) {
+        return rects.length > 0 && y >= rects[0].y && y <= rects[0].y + rects[0].h;
+    }
+
+    // A workspace takes a drop exactly where it is drawn. Upstream's
+    // _withinWorkspace (workspaceThumbnail.js:819-834) cuts WORKSPACE_CUT_SIZE
+    // off each thumbnail for the insert zone instead; here the insert zone is
+    // the gap itself (_getInsertWorkspaceIndex), which computeFitAll keeps
+    // wide enough to aim at. Past the last workspace the drop goes to the
+    // spare one at the end of the row (_firstTrailingEmptyIndex).
+    _getWorkspaceIndexAt(x, y) {
+        const {rects, rtl} = this._collectWorkspaceRects();
+        x = this._readingX(x, rtl);
         for (const r of rects) {
-            // Exclusive lower bound like upstream (workspaceThumbnail.js:833):
-            // with >= the boundary pixel is claimed by the insert zone and by
-            // this one at the same time.
-            const x1 = r.x + WORKSPACE_CUT_SIZE;
-            const x2 = r === last
-                ? r.x + r.w
-                : r.x + r.w - WORKSPACE_CUT_SIZE;
-            if (x > x1 && x <= x2 && y >= r.y && y <= r.y + r.h) {
-                logTime('_getWorkspaceIndexAt: HIT', {
-                    wsIndex: r.i,
-                    x: Math.round(x), y: Math.round(y),
-                    rect: r,
-                });
+            const [x1, x2] = this._visibleSpan(r);
+            if (x >= x1 && x <= x2 && y >= r.y && y <= r.y + r.h) {
+                logTime('_getWorkspaceIndexAt: HIT', {wsIndex: r.i,
+                    x: Math.round(x), y: Math.round(y)});
                 return r.i;
             }
         }
 
-        if (Meta.prefs_get_dynamic_workspaces() &&
-            x > last.x + last.w && y >= last.y && y <= last.y + last.h) {
+        const last = rects[rects.length - 1];
+        if (last && Meta.prefs_get_dynamic_workspaces() &&
+            this._withinRow(rects, y) && x > this._visibleSpan(last)[1]) {
             const spare = this._firstTrailingEmptyIndex();
             logTime('_getWorkspaceIndexAt: past the last -> spare', {spare});
             return spare;
@@ -2040,7 +2308,6 @@ export default class SpatialOverviewExtension extends Extension {
 
         logTime('_getWorkspaceIndexAt: MISS', {
             x: Math.round(x), y: Math.round(y),
-            rects,
         });
         return -1;
     }
@@ -2052,15 +2319,12 @@ export default class SpatialOverviewExtension extends Extension {
     //
     // Gated by Meta.prefs_get_dynamic_workspaces() - same condition the
     // upstream thumbnails check enforces (workspaceThumbnail.js:845).
-    // Returns -1 when dynamic workspaces are off, mirroring upstream.
     //
-    // Zone geometry follows _getPlaceholderTarget (workspaceThumbnail.js:786):
-    // the zone before workspace k spans [k.x - spacing - CUT, k.x + CUT], so it
-    // eats into both neighbours instead of being only the bare gap, and it
-    // widens to the gap _setRowGap opens once engaged there, as upstream
-    // widens by the placeholder's footprint (workspaceThumbnail.js:808-814).
-    // The zone before the first workspace takes the whole margin in front of
-    // the row.
+    // The zone is exactly the empty space before workspace k, as drawn: the
+    // gap between it and the one before, or the whole margin in front of the
+    // first. Once _setRowGap has opened it, that space is the opened gap.
+    // Upstream's zone also reaches WORKSPACE_CUT_SIZE into both neighbours
+    // (workspaceThumbnail.js:786-817); the gap here is wide enough not to.
     //
     // No insert-after-last zone, as upstream has none
     // (workspaceThumbnail.js:851-862): the spare workspace at the end already
@@ -2068,44 +2332,40 @@ export default class SpatialOverviewExtension extends Extension {
     _getInsertWorkspaceIndex(x, y) {
         if (!Meta.prefs_get_dynamic_workspaces())
             return -1;
-        const {rects, spacing} = this._collectWorkspaceRects();
-        if (rects.length === 0)
+        const {rects, rtl} = this._collectWorkspaceRects();
+        if (!this._withinRow(rects, y))
             return -1;
+        x = this._readingX(x, rtl);
 
-        // Use the first rect's y-band as a shared vertical band - works
-        // because in FitMode.ALL all workspaces share the same vertical band.
-        const yTop = rects[0].y;
-        const yBot = rects[0].y + rects[0].h;
-        if (y < yTop || y > yBot)
-            return -1;
-
-        const engaged = this._dropInsertIndex;
         for (let k = 0; k < rects.length; k++) {
-            const r = rects[k];
-            let x1 = k === 0 ? -Infinity : r.x - spacing - WORKSPACE_CUT_SIZE;
-            let x2 = r.x + WORKSPACE_CUT_SIZE;
-            if (r.i === engaged) {
-                x1 -= ROW_GAP_WIDTH / 2;
-                x2 += ROW_GAP_WIDTH / 2;
-            }
-            if (x > x1 && x <= x2)
-                return r.i;
+            const start = k === 0
+                ? -Infinity
+                : this._visibleSpan(rects[k - 1])[1];
+            const [end] = this._visibleSpan(rects[k]);
+            if (x > start && x < end)
+                return rects[k].i;
         }
-
         return -1;
     }
 
     // Returns the rect for the placeholder when the insert cursor is at
     // `insertIndex`: centred in the gap _setRowGap opens, which is centred on
-    // the gap between the two workspaces - before the first one, on where
-    // that gap would be.
+    // the resting gap between the two workspaces; before the first one,
+    // PLACEHOLDER_MARGIN short of where the first workspace opens to.
     //
     // FIXME downstream: upstream sizes the placeholder from its theme node via
     // allocate_preferred_size (workspaceThumbnail.js:1348). That size is meant
     // for thumbnails; against full-size FitMode.ALL workspaces we pick the height
     // from the workspace instead.
     _getInsertRect(insertIndex) {
-        const {rects, spacing} = this._collectWorkspaceRects();
+        const {rects, rtl} = this._collectWorkspaceRects();
+        const rect = this._getReadingInsertRect(insertIndex, rects);
+        if (rect && rtl)
+            rect.x = this._zoomOutView.width - (rect.x + rect.w);
+        return rect;
+    }
+
+    _getReadingInsertRect(insertIndex, rects) {
         if (rects.length === 0)
             return null;
         const PH_W = PLACEHOLDER_WIDTH;
@@ -2115,21 +2375,21 @@ export default class SpatialOverviewExtension extends Extension {
         if (insertIndex === rects[0].i) {
             return {
                 index: insertIndex,
-                x: Math.round(rects[0].x - spacing / 2 - PH_W / 2),
+                x: Math.round(rects[0].bx + ROW_GAP_WIDTH / 2 -
+                    PLACEHOLDER_MARGIN - PH_W),
                 y, w: PH_W, h: PH_H,
             };
         }
-        for (let k = 0; k < rects.length - 1; k++) {
-            const left = rects[k];
-            const right = rects[k + 1];
-            if (insertIndex === right.i) {
-                const gapCenterX = (left.x + left.w + right.x) / 2;
-                return {
-                    index: insertIndex,
-                    x: Math.round(gapCenterX - PH_W / 2),
-                    y, w: PH_W, h: PH_H,
-                };
-            }
+        for (let k = 1; k < rects.length; k++) {
+            if (insertIndex !== rects[k].i)
+                continue;
+            const left = rects[k - 1];
+            const gapCenterX = (left.bx + left.bw + rects[k].bx) / 2;
+            return {
+                index: insertIndex,
+                x: Math.round(gapCenterX - PH_W / 2),
+                y, w: PH_W, h: PH_H,
+            };
         }
         return null;
     }
