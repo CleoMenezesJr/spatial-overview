@@ -32,7 +32,7 @@ const ZOOM_OUT_HOLD_DELAY = 150;
 const MIN_WS_SCALE = 0.18;
 // Gap between fit-all workspaces, as a fraction of a workspace's own size.
 // Upstream's ALL-mode spacing is a flat WORKSPACE_MIN_SPACING (24px,
-// workspacesView.js:22,224) that does not follow the shrinking workspaces.
+// workspacesView.js:22,225) that does not follow the shrinking workspaces.
 const WORKSPACE_GAP_RATIO = 0.006;
 // Upstream emphasises the current workspace by shrinking every other one to
 // WORKSPACE_INACTIVE_SCALE (0.94, workspacesView.js:25). Same 6% difference,
@@ -46,7 +46,7 @@ const WORKSPACE_DOT_DURATION = 500; // panel.js:114,125
 // widthMultiplier (panel.js:91-94), and upstream picks that multiplier in
 // three flat steps - 3.625 up to 2 dots, 3.25 up to 5, 2.75 beyond
 // (panel.js:182-189). The dot is 8px (.workspace-dot min-width 0.5455em,
-// gnome-shell-dark.css:1834-1838), so two workspaces give a 29px pill in a
+// gnome-shell-dark.css:1879-1883), so two workspaces give a 29px pill in a
 // 42px row, and the row only reaches 100px at seven dots.
 //
 // Measured in the mockup on issue #3: a 58px pill against that same 8px dot,
@@ -64,7 +64,7 @@ const WORKSPACE_DOT_WIDTH_PLATEAU = 2;
 // Fraction of the monitor the centered hot zone spans. The size layout.js
 // passes in (panelBox.height) no longer sets the width, only whether there is
 // a barrier at all: HotCorner._onDestroy tears it down by calling
-// setBarrierSize(0) (layout.js:1238-1239).
+// setBarrierSize(0) (layout.js:1220-1221).
 const HOT_EDGE_WIDTH_FRACTION = 1 / 3;
 const PLACEHOLDER_WIDTH = 24;
 
@@ -79,7 +79,7 @@ const ZoomOutView = GObject.registerClass({
             visible: false,
         });
         // Like OverviewActor (overview.js:37). overviewGroup is bound to
-        // uiGroup (layout.js:256-263), so with a monitor left of or above the
+        // uiGroup (layout.js:253-260), so with a monitor left of or above the
         // primary, its origin is not the primary's.
         this.add_constraint(new MonitorConstraint({primary: true}));
 
@@ -90,13 +90,13 @@ const ZoomOutView = GObject.registerClass({
         this.connect('destroy', () => this._removeHideTimeout());
 
         // FIXME downstream: replica of the upstream ThumbnailsBox
-        // _dropPlaceholder (workspaceThumbnail.js:613). Used to signal
+        // _dropPlaceholder (workspaceThumbnail.js:616). Used to signal
         // "drop here creates a new workspace" in FitMode.ALL.
         //
         // Ours is an overlay; upstream allocates its placeholder into the row
         // so the workspaces visibly open a gap. WorkspacesView.vfunc_allocate
         // advances every workspace by one uniform spacing
-        // (workspacesView.js:371-386), leaving no per-gap room to allocate
+        // (workspacesView.js:373-388), leaving no per-gap room to allocate
         // into. Translating the actors instead was tried and reverted: the
         // hit test reads get_transformed_position, so the zone moved with the
         // animation and escaped the cursor every frame. Doing it properly
@@ -171,11 +171,11 @@ const ZoomOutView = GObject.registerClass({
         // _dropPlaceholder + insertWorkspace. We extend the same semantics
         // onto the main WorkspacesView in FitMode.ALL via this extension.
         //
-        // Like ThumbnailsBox.handleDragOver (workspaceThumbnail.js:831), this
+        // Like ThumbnailsBox.handleDragOver (workspaceThumbnail.js:837), this
         // is where the drop target is decided; acceptDrop only consumes it.
         // The two can't be allowed to recompute independently: hover runs off
         // a coalesced idle over motion coordinates (dnd.js:364-370) and its
-        // last queued pass is dropped unrun by _dragComplete (dnd.js:545-548),
+        // last queued pass is dropped unrun by _dragComplete (dnd.js:546-549),
         // while acceptDrop sees the button-release coordinates (dnd.js:386).
         const isWindow = !!source?.metaWindow;
         this._extension._dropWorkspaceIndex = -1;
@@ -279,7 +279,7 @@ export default class SpatialOverviewExtension extends Extension {
                 this._onDragEnd(true);
             });
         // The zoom-in after a drag can outlive the overview: clicking a window
-        // preview while it runs activates it (workspace.js:1393-1397) and
+        // preview while it runs activates it (workspace.js:1394-1398) and
         // that hides the overview from under us. The leave animation reads the
         // workspace geometry, and in FitMode.ALL that geometry is the shrunken
         // one.
@@ -363,7 +363,7 @@ export default class SpatialOverviewExtension extends Extension {
             }
 
             // What the gaps did not absorb goes to the ends. vfunc_allocate
-            // steps by wsSize + adjSpacing (workspacesView.js:376-386), so
+            // steps by wsSize + adjSpacing (workspacesView.js:380-387), so
             // this is the row's real extent.
             const margin = Math.max(
                 (avail - (wsSize * n + adjSpacing * (n - 1))) / 2, 0);
@@ -498,7 +498,7 @@ export default class SpatialOverviewExtension extends Extension {
         // Both of these answer for a preview that may be born, or re-asked,
         // long after the zoom settled - a window opened while fit-all is up
         // builds its WindowPreview then, and its constructor calls
-        // _updateIconScale on the spot (windowPreview.js:227). Pushing the
+        // _updateIconScale on the spot (windowPreview.js:242). Pushing the
         // floating chrome from the zoom's own frames reaches neither.
         this._origUpdateIconScale = WindowPreview.prototype._updateIconScale;
         const origUpdateIconScale = this._origUpdateIconScale;
@@ -514,7 +514,7 @@ export default class SpatialOverviewExtension extends Extension {
         };
 
         // FIXME downstream: the only geometry signal WorkspaceLayout takes is
-        // the MetaWindow's size-changed (workspace.js:801). A window that only
+        // the MetaWindow's size-changed (workspace.js:802). A window that only
         // moves never reaches _needsLayout, and nothing else re-reads where it
         // is - right for the spread, which places windows by its own strategy
         // and ignores where they really are, and wrong for a layout that draws
@@ -522,7 +522,7 @@ export default class SpatialOverviewExtension extends Extension {
         //
         // WindowPreview already emits what is needed: its size-changed fires
         // on every bounding-box change, move included (windowPreview.js:
-        // 86-98). Nothing in workspace.js listens to it.
+        // 101-113). Nothing in workspace.js listens to it.
         //
         // Ideal upstream fix: let WorkspaceLayout follow the preview's
         // size-changed, so the floating layout is as live as the spread.
@@ -538,7 +538,7 @@ export default class SpatialOverviewExtension extends Extension {
         const origSyncOverlay = this._origSyncOverlay;
         // FIXME downstream: overlayEnabled is not a plain flag. Its setter
         // calls showOverlay() on the spot whenever the pointer is on the
-        // preview or it holds the key focus (windowPreview.js:500-503), so
+        // preview or it holds the key focus (windowPreview.js:520-523), so
         // letting the original answer first and correcting it afterwards puts
         // the caption and the close button on screen once per pass - and the
         // _updateWorkspacesState hook runs a pass on every frame of the zoom.
@@ -555,7 +555,7 @@ export default class SpatialOverviewExtension extends Extension {
 
         // FIXME downstream: _doRemoveWindow freezes the layout and thaws it
         // only once the pointer has held still for 750ms away from the
-        // workspace (workspace.js:1147-1183), because in the spread every
+        // workspace (workspace.js:1148-1184), because in the spread every
         // window left behind moves to close the gap and upstream will not do
         // that under the pointer. While the layout is frozen vfunc_allocate
         // skips the slot pass entirely (workspace.js:670), so nothing here
@@ -582,7 +582,7 @@ export default class SpatialOverviewExtension extends Extension {
                 this._layoutFrozenId = 0;
             }
             // The setter calls layout_changed on the way down
-            // (workspace.js:936), which is what re-reads the row.
+            // (workspace.js:937), which is what re-reads the row.
             this._container.layout_manager.layout_frozen = false;
         };
 
@@ -773,7 +773,7 @@ export default class SpatialOverviewExtension extends Extension {
                         // reaches _cancelDrag again mid-tween (dnd.js:569-570,
                         // 450). Its ease removes this one's transitions, which
                         // stops them unfinished, and onStopped reparents the
-                        // clone where it stands (environment.js:161-163,
+                        // clone where it stands (environment.js:193-195,
                         // dnd.js:500-502). The tween running already goes to
                         // the same place.
                         if (self._snapBackRetarget) {
@@ -902,7 +902,7 @@ export default class SpatialOverviewExtension extends Extension {
             // force stateAdjustment.value = 1 so WindowPreviews rearrange
             // (overview layout) to fit the Workspace rect in FitMode.ALL.
             //
-            // The scale two lines below it (workspacesView.js:263) needs the
+            // The scale two lines below it (workspacesView.js:264) needs the
             // same treatment and does not get it: every workspace further than
             // one step from the scroll position is drawn at
             // WORKSPACE_INACTIVE_SCALE, shrunk about its own centre. That is
@@ -935,7 +935,7 @@ export default class SpatialOverviewExtension extends Extension {
                     // The accent belongs to the row, so it has to arrive and
                     // leave with it. Weighting by fitMode is upstream's own
                     // idiom for the same reason one line up
-                    // (workspacesView.js:250).
+                    // (workspacesView.js:251).
                     const fitMode = this._fitModeAdjustment.value;
                     let top = null;
                     let topProgress = 0;
@@ -1046,7 +1046,7 @@ export default class SpatialOverviewExtension extends Extension {
                                 // The re-solve names every registered window,
                                 // the dragged one included - dnd only
                                 // reparents the actor, removeWindow is what
-                                // unregisters it (workspace.js:840-870).
+                                // unregisters it (workspace.js:841-871).
                                 // Hand its slot back out before the allocate
                                 // this answer feeds can reach it in
                                 // Main.uiGroup.
@@ -1092,7 +1092,7 @@ export default class SpatialOverviewExtension extends Extension {
         }
 
         // FIXME downstream: create-new-workspace-via-drop replica of
-        // ThumbnailsBox.acceptDrop (workspaceThumbnail.js:877-920).
+        // ThumbnailsBox.acceptDrop (workspaceThumbnail.js:883-926).
         // Upstream WorkspacesView has no drop-to-create path.
         //
         // Consumes what handleDragOver decided, like upstream acceptDrop; x/y
@@ -1132,7 +1132,7 @@ export default class SpatialOverviewExtension extends Extension {
         return true;
     }
 
-    // FIXME downstream: replica of ThumbnailsBox.acceptDrop (workspaceThumbnail.js:890-920).
+    // FIXME downstream: replica of ThumbnailsBox.acceptDrop (workspaceThumbnail.js:896-926).
     // Creates a new workspace at `index` and moves the window there.
     _createWorkspaceAt(index, metaWindow) {
         if (!Meta.prefs_get_dynamic_workspaces()) {
@@ -1146,7 +1146,7 @@ export default class SpatialOverviewExtension extends Extension {
 
         // Main.wm.insertWorkspace handles: append_new_workspace + slide
         // windows rightward to leave position `index` empty.
-        // (windowManager.js:1019-1050)
+        // (windowManager.js:1020-1051)
         Main.wm.insertWorkspace(index);
 
         const monIdx = Main.layoutManager.primaryIndex;
@@ -1154,7 +1154,7 @@ export default class SpatialOverviewExtension extends Extension {
             metaWindow, monIdx, index, true);
 
         // Keep the workspace alive briefly so startup apps don't
-        // immediately destroy it (workspaceThumbnail.js:918-920).
+        // immediately destroy it (workspaceThumbnail.js:924-926).
         Main.wm.keepWorkspaceAlive(
             global.workspace_manager.get_workspace_by_index(index), 100);
 
@@ -1162,7 +1162,7 @@ export default class SpatialOverviewExtension extends Extension {
     }
 
     // Mirrors ThumbnailsBox._clearDragPlaceholder
-    // (workspaceThumbnail.js:764-770), early return included.
+    // (workspaceThumbnail.js:770-776), early return included.
     _clearDragPlaceholder() {
         if (this._dropInsertIndex === -1)
             return;
@@ -1235,7 +1235,7 @@ export default class SpatialOverviewExtension extends Extension {
         }
         this._draggedMetaWindow = null;
 
-        // Same point upstream clears it: _endDrag (workspaceThumbnail.js:748),
+        // Same point upstream clears it: _endDrag (workspaceThumbnail.js:755),
         // reached from _onDragEnd and _onDragCancelled.
         this._clearDragPlaceholder();
 
@@ -1265,16 +1265,16 @@ export default class SpatialOverviewExtension extends Extension {
     // FIXME downstream: in FitMode.ALL the first click on a preview two
     // workspaces over is spent selecting that workspace. _onCloneSelected only
     // activates the window when _shouldLeaveOverview() agrees, and for an
-    // inactive workspace at WINDOW_PICKER it does not (workspace.js:1111-1117,
-    // 1393-1399), so the window needs a second click. That reading fits
+    // inactive workspace at WINDOW_PICKER it does not (workspace.js:1112-1118,
+    // 1394-1400), so the window needs a second click. That reading fits
     // FitMode.SINGLE, where the neighbours only peek in from the edges; with
     // every workspace fully on screen the click already has a target.
     // Ideal upstream fix: let _shouldLeaveOverview account for the fit mode.
     //
     // The hook is _activate and not _onCloneSelected: the latter is bound per
-    // clone at connect time (workspace.js:1339-1340), so replacing it on a
+    // clone at connect time (workspace.js:1340-1341), so replacing it on a
     // Workspace changes nothing. The click gesture reaches _activate through an
-    // arrow (windowPreview.js:118-119), and the prototype also covers previews
+    // arrow (windowPreview.js:133-134), and the prototype also covers previews
     // built after the hold started - a cross-workspace drop rebuilds one.
     _patchPreviewActivate() {
         if (this._origPreviewActivate)
@@ -1295,7 +1295,7 @@ export default class SpatialOverviewExtension extends Extension {
             const wsIndex = metaWindow.get_workspace()?.index() ?? -1;
             logTime('click on preview: zoom in, then activate', {wsIndex});
             // The window comes after the zoom-in rather than with it:
-            // Main.activateWindow hides the overview (main.js:859), and the
+            // Main.activateWindow hides the overview (main.js:857), and the
             // leave animation starts from whatever picture it finds.
             self._leaveFitAll({
                 duration: ZOOM_IN_ACTIVATE_DURATION,
@@ -1316,7 +1316,7 @@ export default class SpatialOverviewExtension extends Extension {
     _leaveFitAll({animate = true, onDone = null, scrollTo = -1,
         duration = ZOOM_IN_DURATION} = {}) {
         // The overview is already going. prepareToLeaveOverview freezes each
-        // WorkspaceLayout (workspace.js:1299) before 'hiding' is emitted
+        // WorkspaceLayout (workspace.js:1300) before 'hiding' is emitted
         // (overview.js:574-575), so the slots are fixed by the time we get here
         // and the pin makes them the FitMode.SINGLE ones. Only the workspace
         // transform is left, and easing it would run alongside the leave
@@ -1359,7 +1359,7 @@ export default class SpatialOverviewExtension extends Extension {
         // names, so a click two workspaces over has to carry it along.
         // activate_with_focus gets there on its own, but only afterwards -
         // _scrollToActive runs off the switch-workspace signal
-        // (workspacesView.js:406-419), which is the slide across that shows up
+        // (workspacesView.js:407-420), which is the slide across that shows up
         // between the zoom-in and the desktop.
         const scrollAdj = this._getWsDisplay()?._scrollAdjustment;
         if (scrollTo >= 0 && scrollAdj && scrollAdj.value !== scrollTo) {
@@ -1391,7 +1391,7 @@ export default class SpatialOverviewExtension extends Extension {
     }
 
     // FIXME downstream: a preview being dragged keeps its slot - removeWindow
-    // (workspace.js:853) says as much, "the window might have been reparented
+    // (workspace.js:854) says as much, "the window might have been reparented
     // by DND" - so vfunc_allocate keeps calling child.allocate() on an actor
     // that now lives in Main.uiGroup. The slot box is container-local, so it
     // lands somewhere else entirely, and the clone only snaps back under the
@@ -1481,17 +1481,17 @@ export default class SpatialOverviewExtension extends Extension {
                 // returned preview out of them - allocated, still on, and
                 // drawing nowhere until a scroll changed the box. Mark
                 // _needsLayout the way addWindow/removeWindow do
-                // (workspace.js:823, 857), then let the relayout deliver it.
+                // (workspace.js:824, 858), then let the relayout deliver it.
                 //
                 // Morph the slot here first, and hand the chrome back by the
                 // same pass the other previews get theirs from - the returning
-                // one shows what the drag left behind (windowPreview.js:661-668).
+                // one shows what the drag left behind (windowPreview.js:663-670).
                 //
                 // Not while the zoom runs: the box changes every frame, which
                 // re-reads the slots anyway, and a _needsLayout pass counts as
                 // layoutChanged, which eases every preview in the workspace
                 // over 200ms from where it stood (workspace.js:671-675,
-                // 758-759, 389-399) - the ones that never left lag the zoom.
+                // 759-760, 389-399) - the ones that never left lag the zoom.
                 this._floatWindowSlots(lm);
                 this._syncFloatingChrome(w);
                 lm.layout_frozen = false;
@@ -1506,12 +1506,12 @@ export default class SpatialOverviewExtension extends Extension {
 
     // FIXME downstream: at stateAdjustment 0 WorkspaceLayout already draws the
     // picture this asks for - every window where it really is, at
-    // (boundingBox - workarea) * allocationScale (workspace.js:704-735), which
+    // (boundingBox - workarea) * allocationScale (workspace.js:704-736), which
     // is what the app grid shows. Two things keep FitMode.ALL from simply
     // asking for it. _updateWorkspacesState drives that adjustment from
     // workspaceMode, which is why the hook above pins it at 1; and
     // vfunc_allocate clamps the floating box up to the slot size for as long
-    // as currentState <= WINDOW_PICKER (workspace.js:723-729), which holds for
+    // as currentState <= WINDOW_PICKER (workspace.js:724-730), which holds for
     // this whole zoom - it never leaves the window picker. Under that clamp a
     // window smaller than the slot the spread handed it is drawn at the slot's
     // size, hanging off the shrunken workspace.
@@ -1539,9 +1539,10 @@ export default class SpatialOverviewExtension extends Extension {
     // third workspace is on the second by the time the drop animation ends -
     // the row reindexes under a gesture that is still going.
     //
-    // The tracker already knows how to hold still: blockUpdates is what the
-    // workspace switcher popup takes while it is on screen
-    // (windowManager.js:1808-1817). Fit-all is the same kind of moment, only
+    // The tracker already knows how to hold still: the workspace switcher
+    // popup and the workspace switch animation both hold it through
+    // Main.wm.blockWorkspaceUpdates (windowManager.js:1070-1096, 1869-1878;
+    // workspaceAnimation.js:425,433). Fit-all is the same kind of moment, only
     // longer - the whole row is on screen and being dragged across.
     // Collection resumes on the way out, which is where upstream would have
     // done it anyway.
@@ -1599,15 +1600,15 @@ export default class SpatialOverviewExtension extends Extension {
         };
 
         // The cache the floating layout reads is filled from this one
-        // property (windowPreview.js:79-98), so this is the signal that says
+        // property (windowPreview.js:94-113), so this is the signal that says
         // "the number you are drawing from just changed". WindowPreview's own
         // size-changed is a filtered relay of it - it drops the notification
-        // whenever the box is empty (windowPreview.js:96-97), which is
+        // whenever the box is empty (windowPreview.js:111-112), which is
         // precisely the state a window being dragged passes through.
         preview.windowContainer?.layout_manager?.connectObject(
             'notify::bounding-box', refloat, lm);
         // Mutter's own pair, for the case where the actor's box has not
-        // caught up yet: upstream only takes size-changed (workspace.js:801),
+        // caught up yet: upstream only takes size-changed (workspace.js:802),
         // and a window that is moved without being resized never reaches it.
         preview.metaWindow?.connectObject(
             'position-changed', refloat,
@@ -1651,7 +1652,7 @@ export default class SpatialOverviewExtension extends Extension {
     }
 
     // Which box says where the window is: upstream's own answer for its
-    // floating branch, WindowPreview.boundingBox (workspace.js:707-711) - the
+    // floating branch, WindowPreview.boundingBox (workspace.js:707-712) - the
     // union of the actors the preview draws, so it covers shadows and
     // attached dialogs, which the frame rect does not.
     //
@@ -1690,9 +1691,9 @@ export default class SpatialOverviewExtension extends Extension {
 
     // The app icon and the hover overlay are drawn for the spread and outlive
     // it: the icon's scale follows the overview state, which stays on
-    // WINDOW_PICKER for the whole zoom (windowPreview.js:238-251), and
+    // WINDOW_PICKER for the whole zoom (windowPreview.js:258-271), and
     // _syncOverlay keys off the state adjustment the hook pins at 1
-    // (workspace.js:775-777). Both would sit over a layout that has no room
+    // (workspace.js:776-778). Both would sit over a layout that has no room
     // for them - the icons the issue calls distracting, on windows small
     // enough that the overlay covers what it labels.
     _syncFloatingChrome(workspace) {
@@ -1703,8 +1704,8 @@ export default class SpatialOverviewExtension extends Extension {
         // (dnd.js:220-227), so the child list stops naming the one preview
         // whose chrome the zoom still has to fade - the window being
         // carried. _windows keeps naming it until removeWindow runs
-        // (workspace.js:840-870), and it is the set syncOverlays already
-        // walks (workspace.js:783).
+        // (workspace.js:841-871), and it is the set syncOverlays already
+        // walks (workspace.js:784).
         //
         // Both are patched to read the zoom, so asking upstream's own
         // question again is what carries the fade - and what hands the answer
@@ -1715,7 +1716,7 @@ export default class SpatialOverviewExtension extends Extension {
 
             // FIXME downstream: hideOverlay clears _overlayShown before the
             // fade that takes the caption and the close button off, and its
-            // own guard reads that flag (windowPreview.js:359-381). A fade
+            // own guard reads that flag (windowPreview.js:379-401). A fade
             // that never finishes therefore leaves both on screen with the
             // flag already saying they are down, and no later call reaches
             // them - measured with fit-all up: both actors visible,
@@ -1833,7 +1834,7 @@ export default class SpatialOverviewExtension extends Extension {
     }
 
     // The horizontal cut mirrors upstream _withinWorkspace
-    // (workspaceThumbnail.js:812-828): the outer WORKSPACE_CUT_SIZE of each
+    // (workspaceThumbnail.js:819-834): the outer WORKSPACE_CUT_SIZE of each
     // workspace belongs to the neighbouring insert zone, not to the workspace.
     _getWorkspaceIndexAt(x, y) {
         const {rects, monitor} = this._collectWorkspaceRects();
@@ -1844,7 +1845,7 @@ export default class SpatialOverviewExtension extends Extension {
             return -1;
         }
         for (const r of rects) {
-            // Exclusive lower bound like upstream (workspaceThumbnail.js:827):
+            // Exclusive lower bound like upstream (workspaceThumbnail.js:833):
             // with >= the boundary pixel is claimed by the insert zone and by
             // this one at the same time.
             const x1 = r.x + WORKSPACE_CUT_SIZE;
@@ -1871,10 +1872,10 @@ export default class SpatialOverviewExtension extends Extension {
     // rightward, matching upstream ThumbnailsBox semantics).
     //
     // Gated by Meta.prefs_get_dynamic_workspaces() - same condition the
-    // upstream thumbnails check enforces (workspaceThumbnail.js:836).
+    // upstream thumbnails check enforces (workspaceThumbnail.js:845).
     // Returns -1 when dynamic workspaces are off, mirroring upstream.
     //
-    // Zone geometry follows _getPlaceholderTarget (workspaceThumbnail.js:780):
+    // Zone geometry follows _getPlaceholderTarget (workspaceThumbnail.js:786):
     // the zone before workspace k spans [k.x - spacing - CUT, k.x + CUT], so it
     // eats into both neighbours instead of being only the bare gap, and it
     // widens by the placeholder's footprint once engaged there.
@@ -1913,7 +1914,7 @@ export default class SpatialOverviewExtension extends Extension {
         }
 
         // FIXME downstream: upstream has no insert-after-last zone - its loop
-        // only builds insert-before zones (workspaceThumbnail.js:845-856).
+        // only builds insert-before zones (workspaceThumbnail.js:851-862).
         const last = rects[rects.length - 1];
         let afterX1 = last.x + last.w - WORKSPACE_CUT_SIZE;
         if (last.i + 1 === engaged)
@@ -1928,7 +1929,7 @@ export default class SpatialOverviewExtension extends Extension {
     // `insertIndex`, centered in the gap between workspace panels.
     //
     // FIXME downstream: upstream sizes the placeholder from its theme node via
-    // allocate_preferred_size (workspaceThumbnail.js:1340). That size is meant
+    // allocate_preferred_size (workspaceThumbnail.js:1348). That size is meant
     // for thumbnails; against full-size FitMode.ALL workspaces we pick the height
     // from the workspace instead.
     _getInsertRect(insertIndex) {
@@ -2215,7 +2216,7 @@ export default class SpatialOverviewExtension extends Extension {
                 view._origUpdateWorkspacesState = null;
                 // The accent raised one workspace above its siblings; put the
                 // row back in workspace order, the way upstream restacks it
-                // after a reorder (workspacesView.js:119-122).
+                // after a reorder (workspacesView.js:118-123).
                 view._workspaces?.forEach(
                     (w, i) => view.set_child_at_index(w, i));
                 view._updateWorkspacesState();
@@ -2252,9 +2253,9 @@ export default class SpatialOverviewExtension extends Extension {
 
     // FIXME downstream: the hot corner is hardcoded to the monitor's top-left.
     // LayoutManager._updateHotCorners builds every HotCorner at
-    // `cornerX = monitor.x` (layout.js:450-451), and HotCorner.setBarrierSize
+    // `cornerX = monitor.x` (layout.js:449-450), and HotCorner.setBarrierSize
     // welds an L of two barriers to that origin, growing +X and +Y
-    // (layout.js:1221-1231). Nothing in between is configurable.
+    // (layout.js:1203-1213). Nothing in between is configurable.
     //
     // With Activities moved to the panel's center by _patchPanelLayout, the
     // corner that opens the overview and the button that opens the overview
@@ -2302,12 +2303,12 @@ export default class SpatialOverviewExtension extends Extension {
             const centerX = Math.round(this._monitor.x + this._monitor.width / 2);
             const x = centerX - Math.round(width / 2);
 
-            // _toggleOverview plays the ripple at this._x (layout.js:1253),
+            // _toggleOverview plays the ripple at this._x (layout.js:1235),
             // so move it too or the feedback stays in the old corner.
             this._x = centerX;
 
             // Ripples places the wave by pivot point plus a matching
-            // translation (ripples.js:22-36,63). HotCorner pivots at (0, 0)
+            // translation (ripples.js:21-39,61). HotCorner pivots at (0, 0)
             // so a quarter disc blooms away from the screen corner; centered
             // on the top edge that same pivot drags the wave in from the
             // upper left. (0.5, 0) anchors it to the edge and centers it, and
@@ -2354,7 +2355,7 @@ export default class SpatialOverviewExtension extends Extension {
 
     _getWorkspaceIndicators() {
         // ActivitiesButton adds exactly one child, the WorkspaceIndicators box
-        // (panel.js:211).
+        // (panel.js:229).
         return Main.panel?.statusArea?.activities?.get_first_child() ?? null;
     }
 
@@ -2370,7 +2371,7 @@ export default class SpatialOverviewExtension extends Extension {
     // the row holds a hole the dot no longer paints into; at +540ms destroy()
     // fires and the row snaps 13px (8px dot + 5px BoxLayout spacing). With
     // Activities in _centerBox that snap is halved into a 6px sideways jump of
-    // the whole row, because Panel.vfunc_allocate centers it (panel.js:512).
+    // the whole row, because Panel.vfunc_allocate centers it (panel.js:540).
     //
     // The fix belongs in vfunc_get_preferred_width, but it cannot go there
     // from an extension: GJS wires vfuncs into the class vtable at
@@ -2435,7 +2436,7 @@ export default class SpatialOverviewExtension extends Extension {
         // slot - and its margins were 0, the value syncMargin computes from
         // scale 0, so it was already stranded when this adopted the row. The
         // window is any stretch with the shell alive and these handlers off:
-        // metadata.json declares no session-modes, so extensionSystem.js:393
+        // metadata.json declares no session-modes, so extensionSystem.js:396
         // defaults us to ['user'] and the lock screen disables us mid-ease.
         //
         // Ideal upstream fix: onStopped instead of onComplete in both, so a
@@ -2479,7 +2480,7 @@ export default class SpatialOverviewExtension extends Extension {
         // rest of the session.
         //
         // _addToPanelBox reparents the Activities container on every
-        // sessionMode change (panel.js:693-700), _reapplyPanelLayout again
+        // sessionMode change (panel.js:711-718), _reapplyPanelLayout again
         // after it. Measured across one such reparent, upstream's scaleIn
         // (panel.js:107-131) left a dot at scale 0.27 and 8px wide, and its
         // scaleOutAndDestroy never reached onComplete: the dot stayed a child
@@ -2614,9 +2615,9 @@ export default class SpatialOverviewExtension extends Extension {
 
     // FIXME downstream: panel item positions are hardcoded in sessionMode.js
     // ('user' mode: `left: ['activities'], center: ['dateMenu']`,
-    // sessionMode.js:97-99). There is no GSettings key, no dconf knob, no
+    // sessionMode.js:99-101). There is no GSettings key, no dconf knob, no
     // extension API to swap them, so this reparents the indicators' containers
-    // between Panel._leftBox and Panel._centerBox (panel.js:446-451), neither
+    // between Panel._leftBox and Panel._centerBox (panel.js:474-479), neither
     // of which is exported on the Panel class.
     //
     // sessionMode.connect('updated') re-runs Panel._updatePanel on every mode
@@ -2638,7 +2639,7 @@ export default class SpatialOverviewExtension extends Extension {
         const dateMenu = panel.statusArea.dateMenu;
         const activities = panel.statusArea.activities;
 
-        // ActivitiesButton has no menu (panel.js:201, dontCreateMenu=true) and
+        // ActivitiesButton has no menu (panel.js:219, dontCreateMenu=true) and
         // DateMenuButton aligns at 0.5 (dateMenu.js:863), so neither carries a
         // position-dependent menu anchor. The geometry is not neutral though:
         // at the left edge the clock's ButtonBox hpadding becomes a visible
@@ -2660,7 +2661,7 @@ export default class SpatialOverviewExtension extends Extension {
         }
 
         // Upstream _updatePanel sets this from
-        // `panel.left.includes('dateMenu')` (panel.js:641-647). Follow the
+        // `panel.left.includes('dateMenu')` (panel.js:659-665). Follow the
         // same rule so notification banners line up under the new clock side.
         if (dateMenu?.container) {
             this._origBannerAlignment = Main.messageTray.bannerAlignment;
@@ -2747,13 +2748,13 @@ export default class SpatialOverviewExtension extends Extension {
     }
 
     // ActivitiesButton keeps a 'checked' pseudo class for as long as the
-    // overview is up (panel.js:211-219), which the theme paints as a filled
+    // overview is up (panel.js:229-237), which the theme paints as a filled
     // pill behind the dots. Upstream that pill sits in the panel's left
     // corner; _patchPanelLayout centers it, directly above the overview's
     // search entry - two stacked pills of the same shape (issue #2).
     //
     // 'active' on a panel button means its menu is open (panelMenu.js:
-    // 168-172) and this button is built without one (panel.js:200), so
+    // 174-178) and this button is built without one (panel.js:218), so
     // dropping 'checked' leaves the theme painting hover and focus only -
     // the feedback the issue asks to keep.
     _patchActivitiesChecked() {
@@ -2802,7 +2803,7 @@ export default class SpatialOverviewExtension extends Extension {
     // that is the whole point of the pad.
     //
     // _patchPanelLayout docks the clock in _leftBox, which Panel allocates
-    // against the start edge of the screen (panel.js:518-523, mirrored under
+    // against the start edge of the screen (panel.js:546-551, mirrored under
     // RTL). There the pad has nothing left to balance: it sits between the
     // screen edge and the pill, and every notification pushes the pill inward
     // by the dot's width plus the box's 2px spacing until the dot clears.

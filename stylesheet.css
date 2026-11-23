@@ -1,8 +1,9 @@
 /* FIXME downstream: replica of the upstream ThumbnailsBox _dropPlaceholder
-   style (workspaceThumbnail.js:613, themed via gnome-shell's .placeholder
-   class). Identical CSS to gnome-shell-theme .placeholder rules:
-   width: 18px, height: 32px, background-image from workspace-placeholder.svg.
-   We re-use the same SVG already embedded in gnome-shell-theme.gresource. */
+   style (workspaceThumbnail.js:616). Upstream scopes the rule to
+   `.workspace-thumbnails .placeholder` (gnome-shell-dark.css:2751-2754):
+   the same workspace-placeholder.svg from gnome-shell-theme.gresource,
+   background-size contain, width 18px, no height. Ours is not inside
+   .workspace-thumbnails, so it needs its own rule; width is 24px. */
 .placeholder {
   background-image: url("resource:///org/gnome/shell/theme/workspace-placeholder.svg");
   background-size: contain;
@@ -10,7 +11,7 @@
 }
 
 /* FIXME downstream: PanelMenu.ButtonBox insets its child by -natural-hpadding
-   on both sides (panelMenu.js:71-78, 12px from the theme's
+   on both sides (panelMenu.js:73-79, 12px from the theme's
    `#panel .panel-button` rule). For .clock-display the theme disables the
    button's own background (`background: none !important`) and paints the pill
    on the inner .clock instead, so that inset is dead space in front of the
@@ -20,7 +21,7 @@
    edge and costs the Fitts target the edge would give.
 
    Zeroing it puts .clock at x=0, and its own 3px transparent border
-   (gnome-shell-dark.css:1888-1891) leaves the pill starting at x=3 - the same
+   (gnome-shell-dark.css:1933-1936) leaves the pill starting at x=3 - the same
    offset #panelActivities had when upstream owned this corner.
 
    Ideal upstream fix: let ButtonBox take asymmetric padding, so an item at a
@@ -31,7 +32,7 @@
 }
 
 /* FIXME downstream: the hot corner ripple is a quarter disc, by construction.
-   gnome-shell-dark.css:2028-2035 gives .ripple-box a 52x52 box with
+   gnome-shell-dark.css:2073-2080 gives .ripple-box a 52x52 box with
    `border-radius: 0 0 52px 0` - one rounded corner - and HotCorner pivots it
    at (0, 0), so the arc bulges away from the screen corner while the rest
    falls off-screen. That is right for a corner and wrong for anything else.
