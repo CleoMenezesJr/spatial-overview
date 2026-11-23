@@ -85,6 +85,9 @@ const ROW_GAP_DELAY = 80;
 const ROW_BUMP_THRESHOLD = 20;
 const ROW_BUMP_REPEAT_TIMEOUT = 1000;
 const ROW_SCROLL_DURATION = 300;
+// How long a dragged file rests on a window before it is activated
+// (overview.js:22).
+const DND_WINDOW_SWITCH_TIMEOUT = 750;
 // The app grid keeps PAGE_PREVIEW_RATIO of its neighbouring pages in view
 // (appDisplay.js:48).
 const ROW_PREVIEW_RATIO = 0.20;
@@ -266,6 +269,8 @@ class ZoomOutView extends St.Widget {
     handleDragOver(source, _dragActor, x, y, _time) {
         if (!this._extension)
             return DND.DragMotionResult.CONTINUE;
+        if (source === Main.xdndHandler)
+            return this._extension._fileDragOver(x, y);
 
 
         // FIXME downstream: in GNOME upstream, only the ThumbnailsBox uses
@@ -354,6 +359,16 @@ export default class SpatialOverviewExtension extends Extension {
         this._rowN = 0;
         this._rowWidth = 0;
         this._wsInset = 0;
+        this._fileDragActive = false;
+        this._fileDragMonitor = null;
+        this._fileHoverKey = null;
+        this._fileHoverTimeoutId = 0;
+        this._overviewShownId = 0;
+        this._overviewShowingId = 0;
+        this._overviewHiddenId = 0;
+        this._controlsUpdateOrig = null;
+        this._fileEngageWatch = null;
+        this._floatFromDesktop = false;
         this._sessionModeUpdatedId = 0;
         this._minWorkspacesProto = null;
         this._panelPatched = false;
@@ -376,6 +391,7 @@ export default class SpatialOverviewExtension extends Extension {
         this._patchHotCorner();
         this._patchPreviewActivate();
         this._patchFitAllLayout();
+        this._patchControlsFitMode();
 
         this._zoomOutView = new ZoomOutView();
         this._zoomOutView._extension = this;
@@ -405,9 +421,248 @@ export default class SpatialOverviewExtension extends Extension {
         // workspace geometry, and in FitMode.ALL that geometry is the shrunken
         // one.
         this._overviewHidingId = Main.overview.connect('hiding', () => {
+            logTime('overview hiding', {
+                engaged: this._spatialEngaged,
+                fileDrag: this._fileDragActive,
+                fromDesktop: this._floatFromDesktop,
+            });
+            // Entered from the desktop, the overview's state carries the zoom
+            // back down with it; 'hidden' hands the workspaces back.
+            if (this._spatialEngaged && !this._floatFromDesktop)
+                this._leaveFitAll({animate: false});
+            if (this._fileDragActive)
+                this._endFileFitAll();
+        });
+
+        Main.xdndHandler.connectObject(
+            'drag-begin', () => this._onFileDragBegin(),
+            'drag-end', () => this._onFileDragEnd(),
+            this);
+        this._overviewShowingId = Main.overview.connect('showing', () => {
+            if (this._fileDragActive)
+                this._queueFileEngage();
+        });
+        this._overviewHiddenId = Main.overview.connect('hidden', () => {
             if (this._spatialEngaged)
                 this._leaveFitAll({animate: false});
         });
+        this._overviewShownId = Main.overview.connect('shown', () => {
+            if (this._fileDragActive)
+                this._engageFileFitAll();
+        });
+    }
+
+    // FIXME downstream: ControlsManager._update writes the fit mode on
+    // every step of the overview's state, from its own map of states
+    // (overviewControls.js:588-597), and both ends of entering the overview
+    // map to FitMode.SINGLE (overviewControls.js:494-498). So nothing can ease
+    // the fit mode while the overview animates; each frame puts it back.
+    //
+    // For a fit-all entered from the desktop, take the overview's progress
+    // as the fit mode instead: the row arrives and leaves with the overview,
+    // at its duration and on its curve, whichever way it is going.
+    //
+    // Ideal upstream fix: let the workspaces view ask for FitMode.ALL as the
+    // window picker's fit mode.
+    _patchControlsFitMode() {
+        const controls = this._getControls();
+        if (!controls || this._controlsUpdateOrig)
+            return;
+        const orig = controls._update;
+        this._controlsUpdateOrig = orig;
+        const self = this;
+        controls._update = function () {
+            orig.call(this);
+            if (!self._floatFromDesktop || !self._spatialLayoutActive())
+                return;
+            this._workspacesDisplay.fitModeAdjustment.value = Math.clamp(
+                this._stateAdjustment.value - ControlsState.HIDDEN, 0, 1);
+        };
+    }
+
+    _restoreControlsFitMode() {
+        const controls = this._getControls();
+        if (controls && this._controlsUpdateOrig)
+            controls._update = this._controlsUpdateOrig;
+        this._controlsUpdateOrig = null;
+    }
+
+    // FIXME downstream: a file dragged from an application reaches the
+    // overview through the Activities button (panel.js:248-255) and, once
+    // there, can only travel by hovering: a window activates after
+    // DND_WINDOW_SWITCH_TIMEOUT (overview.js:294-323) and a workspace
+    // thumbnail activates its workspace (workspaceThumbnail.js:518-521). The
+    // drop itself belongs to the application, so XdndHandler never calls
+    // acceptDrop (xdndHandler.js:89-126). HotCorner also answers
+    // handleDragOver for it (layout.js:1239-1245), but nothing adds the
+    // corner to the stage or gives it a _delegate, so the picks never reach
+    // it.
+    //
+    // This extension hides the thumbnails, so a file in the overview had
+    // nowhere to go but the windows of the current workspace. Fit-all puts
+    // every workspace on screen instead, for as long as a file drag is in
+    // the overview - the overview being where a file goes only to leave the
+    // workspace it came from, so a drag between two windows of one workspace
+    // never sees it.
+    //
+    // Ideal upstream fix: let the main WorkspacesView take the thumbnails'
+    // place during a file drag.
+    _onFileDragBegin() {
+        this._fileDragActive = true;
+        this._fileDragMonitor = {
+            dragMotion: dragEvent => {
+                if (dragEvent.source === Main.xdndHandler)
+                    this._maybeScrollRow(dragEvent.x);
+                return DND.DragMotionResult.CONTINUE;
+            },
+        };
+        DND.addDragMonitor(this._fileDragMonitor);
+        if (Main.overview.visible && !Main.overview.animationInProgress)
+            this._engageFileFitAll();
+    }
+
+    _onFileDragEnd() {
+        // overview.js connects first (overview.js:179-180), so a drag that
+        // ends in the overview has already sent it back to where it started
+        // and hidden it, and 'hiding' has run _endFileFitAll.
+        this._endFileFitAll();
+        this._fileDragActive = false;
+        if (this._fileDragMonitor) {
+            DND.removeDragMonitor(this._fileDragMonitor);
+            this._fileDragMonitor = null;
+        }
+    }
+
+    // 'showing' comes after prepareToEnterOverview has built the workspaces
+    // and before anything has laid them out (overview.js:517-519), so the
+    // engage, whose pin reads the slots the layout last solved, waits for
+    // the first allocation of the workspace being shown. From there the zoom
+    // runs alongside the overview's own animation.
+    _queueFileEngage() {
+        this._cancelFileEngage();
+        const index = global.workspace_manager.get_active_workspace_index();
+        const container = this._getFitAllWorkspaces()
+            .find(w => w?.metaWorkspace?.index() === index)?._container;
+        if (!container)
+            return;
+        const id = container.connect('notify::allocation', () => {
+            // Notified once before anything is laid out as well, with no
+            // slots solved yet for the pin to read.
+            if (!container.layout_manager?._windowSlotsBox)
+                return;
+            this._cancelFileEngage();
+            this._engageFileFitAll();
+        });
+        this._fileEngageWatch = {container, id};
+    }
+
+    _cancelFileEngage() {
+        const watch = this._fileEngageWatch;
+        this._fileEngageWatch = null;
+        watch?.container.disconnect(watch.id);
+    }
+
+    // Entered from the desktop rather than from the spread, so the windows
+    // stay where they are on the desktop the whole way in: see
+    // _floatFromDesktop in _floatWindowSlots.
+    _engageFileFitAll() {
+        this._cancelFileEngage();
+        if (this._spatialEngaged || this._isInAppGrid())
+            return;
+        logTime('file drag in the overview: fit-all', {
+            animating: Main.overview.animationInProgress,
+        });
+        this._floatFromDesktop = true;
+        this._engageSpatialLayout();
+    }
+
+    _endFileFitAll() {
+        this._cancelFileEngage();
+        this._resetFileHover();
+        this._resetRowBump();
+        this._disconnectFitModeNotify();
+        // A zoom-in already under way, or one the overview's own leave
+        // animation is carrying, is not ours to start again.
+        const leaving = this._getWsDisplay()?._fitModeAdjustment
+            ?.get_transition('value');
+        const carried = this._floatFromDesktop && Main.overview.animationInProgress;
+        if (this._spatialLayoutActive() && !leaving && !carried)
+            this._leaveFitAll();
+        if (this._zoomOutView?.visible)
+            this._zoomOutView.hide();
+    }
+
+    _resetFileHover() {
+        if (this._fileHoverTimeoutId) {
+            GLib.source_remove(this._fileHoverTimeoutId);
+            this._fileHoverTimeoutId = 0;
+        }
+        this._fileHoverKey = null;
+    }
+
+    // Overview._onDragMotion's rule (overview.js:294-323), held for the
+    // workspace too: resting DND_WINDOW_SWITCH_TIMEOUT on a window activates
+    // it, and on the rest of a workspace activates the workspace, and either
+    // leaves the overview so the file can be dropped there. Upstream's own
+    // timer never sees a window here: the pick lands on ZoomOutView, which
+    // is reactive and sits over the workspaces.
+    _fileDragOver(x, y) {
+        if (!this._spatialLayoutActive()) {
+            this._resetFileHover();
+            return DND.DragMotionResult.CONTINUE;
+        }
+
+        const wsIndex = this._getWorkspaceIndexAt(x, y, {spare: false});
+        if (wsIndex < 0) {
+            this._resetFileHover();
+            return DND.DragMotionResult.CONTINUE;
+        }
+
+        const [vx, vy] = this._zoomOutView.get_transformed_position();
+        const metaWindow = this._windowAt(wsIndex, vx + x, vy + y);
+        const key = metaWindow ?? `ws${wsIndex}`;
+        if (key === this._fileHoverKey)
+            return DND.DragMotionResult.COPY_DROP;
+
+        this._resetFileHover();
+        this._fileHoverKey = key;
+        const time = global.get_current_time();
+        this._fileHoverTimeoutId = GLib.timeout_add(
+            GLib.PRIORITY_DEFAULT, DND_WINDOW_SWITCH_TIMEOUT, () => {
+                this._fileHoverTimeoutId = 0;
+                this._fileHoverKey = null;
+                if (metaWindow) {
+                    logTime('file rested on a window', {wsIndex});
+                    Main.activateWindow(metaWindow, time);
+                } else {
+                    logTime('file rested on a workspace', {wsIndex});
+                    global.workspace_manager.get_workspace_by_index(wsIndex)
+                        ?.activate(time);
+                }
+                Main.overview.hide();
+                return GLib.SOURCE_REMOVE;
+            });
+        return DND.DragMotionResult.COPY_DROP;
+    }
+
+    // The topmost window preview of workspace wsIndex under the stage point,
+    // by the window it draws rather than the preview's chrome.
+    _windowAt(wsIndex, stageX, stageY) {
+        const ws = this._getFitAllWorkspaces()
+            .find(w => w?.metaWorkspace?.index() === wsIndex);
+        const previews = ws?._container?.get_children() ?? [];
+        for (let i = previews.length - 1; i >= 0; i--) {
+            const preview = previews[i];
+            const target = preview.windowContainer ?? preview;
+            if (!preview.metaWindow || !target.visible)
+                continue;
+            const [px, py] = target.get_transformed_position();
+            const [pw, ph] = target.get_transformed_size();
+            if (stageX >= px && stageX <= px + pw &&
+                stageY >= py && stageY <= py + ph)
+                return preview.metaWindow;
+        }
+        return null;
     }
 
     // FIXME downstream: Upstream _getFirstFitAllWorkspaceBox divides available
@@ -719,6 +974,27 @@ export default class SpatialOverviewExtension extends Extension {
             Main.overview.disconnect(this._overviewHidingId);
             this._overviewHidingId = null;
         }
+        if (this._overviewShownId) {
+            Main.overview.disconnect(this._overviewShownId);
+            this._overviewShownId = 0;
+        }
+        if (this._overviewShowingId) {
+            Main.overview.disconnect(this._overviewShowingId);
+            this._overviewShowingId = 0;
+        }
+        if (this._overviewHiddenId) {
+            Main.overview.disconnect(this._overviewHiddenId);
+            this._overviewHiddenId = 0;
+        }
+        this._restoreControlsFitMode();
+        this._cancelFileEngage();
+        Main.xdndHandler.disconnectObject(this);
+        this._resetFileHover();
+        if (this._fileDragMonitor) {
+            DND.removeDragMonitor(this._fileDragMonitor);
+            this._fileDragMonitor = null;
+        }
+        this._fileDragActive = false;
 
         // The adjustment is the shell's own. Disabling while in fit-all
         // would leave it there with nothing left to ease it back.
@@ -968,10 +1244,16 @@ export default class SpatialOverviewExtension extends Extension {
                 this._fitModeNotifyId = this._fitModeNotifyAdj.connect(
                     'notify::value', () => this._revalidateDragHover());
 
-                ws._fitModeAdjustment.ease(FitMode.ALL, {
-                    duration: ZOOM_OUT_DURATION,
-                    mode: Clutter.AnimationMode.EASE_OUT_CUBIC,
-                });
+                // Entered from the desktop, the overview's own state carries
+                // the zoom (_patchControlsFitMode).
+                if (this._floatFromDesktop) {
+                    controls._update();
+                } else {
+                    ws._fitModeAdjustment.ease(FitMode.ALL, {
+                        duration: ZOOM_OUT_DURATION,
+                        mode: Clutter.AnimationMode.EASE_OUT_CUBIC,
+                    });
+                }
             }
 
             // FIXME downstream: whenever upstream GNOME exposes this flag,
@@ -2020,7 +2302,9 @@ export default class SpatialOverviewExtension extends Extension {
         if (!workarea?.width || !spread)
             return;
 
-        const fitMode = this._floatingFitMode();
+        // A fit-all entered with the overview starts on the desktop, which
+        // is the floating picture at full size; there is no spread to leave.
+        const weight = this._floatFromDesktop ? 1 : this._floatingFitMode();
         const scale = lm._spatialRefBox.get_width() / workarea.width;
 
         for (const slot of lm._spatialRefSlots) {
@@ -2037,7 +2321,7 @@ export default class SpatialOverviewExtension extends Extension {
                 width * scale, height * scale,
             ];
             for (let i = 0; i < 4; i++)
-                slot[i] = from[i] + (to[i] - from[i]) * fitMode;
+                slot[i] = from[i] + (to[i] - from[i]) * weight;
         }
     }
 
@@ -2278,7 +2562,7 @@ export default class SpatialOverviewExtension extends Extension {
     // the gap itself (_getInsertWorkspaceIndex), which computeFitAll keeps
     // wide enough to aim at. Past the last workspace the drop goes to the
     // spare one at the end of the row (_firstTrailingEmptyIndex).
-    _getWorkspaceIndexAt(x, y) {
+    _getWorkspaceIndexAt(x, y, {spare = true} = {}) {
         const {rects, rtl} = this._collectWorkspaceRects();
         x = this._readingX(x, rtl);
         for (const r of rects) {
@@ -2291,7 +2575,7 @@ export default class SpatialOverviewExtension extends Extension {
         }
 
         const last = rects[rects.length - 1];
-        if (last && Meta.prefs_get_dynamic_workspaces() &&
+        if (spare && last && Meta.prefs_get_dynamic_workspaces() &&
             this._withinRow(rects, y) && x > this._visibleSpan(last)[1]) {
             const spare = this._firstTrailingEmptyIndex();
             logTime('_getWorkspaceIndexAt: past the last -> spare', {spare});
@@ -2613,6 +2897,7 @@ export default class SpatialOverviewExtension extends Extension {
     }
 
     _restoreWorkspacesState() {
+        this._floatFromDesktop = false;
         this._unblockWorkspaceCollection();
         this._resetRowGap();
         this._reattachDetachedSlots();
