@@ -1145,7 +1145,10 @@ export default class SpatialOverviewExtension extends Extension {
 
         if (insertIndex >= 0) {
             logTime('_handleDrop: insert workspace at', insertIndex);
+            const follow = this._dropEmptiesActiveWorkspace(metaWindow);
             this._createWorkspaceAt(insertIndex, metaWindow);
+            if (follow)
+                this._followDroppedWindow(insertIndex);
             return true;
         }
 
@@ -1166,13 +1169,47 @@ export default class SpatialOverviewExtension extends Extension {
             to: wsIndex,
             title: metaWindow.get_title?.() ?? '?',
         });
+        const follow = this._dropEmptiesActiveWorkspace(metaWindow);
         metaWindow.change_workspace(targetWs);
+        if (follow)
+            this._followDroppedWindow(wsIndex);
         // Don't snap fitModeAdjustment here - _onDragEnd (triggered
         // synchronously by change_workspace -> window-drag-end signal)
         // owns the zoom-in ease. Snapping here would remove_transition
         // and set value=FitMode.SINGLE mid-ease, skipping the animation.
         logTime('_handleDrop: change_workspace RETURNED');
         return true;
+    }
+
+    // A drop on a workspace thumbnail leaves the overview where it is
+    // (workspaceThumbnail.js:883-926), and so does a drop here - except when
+    // the window was the last one on the workspace being shown. Staying there
+    // would show an empty workspace, which _checkWorkspaces collects once
+    // it is no longer the active one (windowManager.js:280-281, 283-289).
+    // "Empty" is counted the way _checkWorkspaces counts it
+    // (windowManager.js:254-264).
+    _dropEmptiesActiveWorkspace(metaWindow) {
+        const origin = metaWindow.get_workspace();
+        if (!origin || origin !== global.workspace_manager.get_active_workspace())
+            return false;
+
+        return !global.get_window_actors().some(actor => {
+            const win = actor.get_meta_window();
+            return win && win !== metaWindow && !win.is_on_all_workspaces() &&
+                win.get_workspace() === origin;
+        });
+    }
+
+    // The path a click on a workspace thumbnail takes in the overview
+    // (workspaceThumbnail.js:505-514, windowManager.js:1883-1889); the view
+    // follows through switch-workspace -> _scrollToActive
+    // (workspacesView.js:407-420), alongside the zoom-in.
+    _followDroppedWindow(index) {
+        const ws = global.workspace_manager.get_workspace_by_index(index);
+        if (!ws)
+            return;
+        logTime('_handleDrop: origin emptied, following to', index);
+        Main.wm.actionMoveWorkspace(ws);
     }
 
     // FIXME downstream: replica of ThumbnailsBox.acceptDrop (workspaceThumbnail.js:896-926).
