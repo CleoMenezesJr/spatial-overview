@@ -67,6 +67,10 @@ const WORKSPACE_DOT_WIDTH_PLATEAU = 2;
 // setBarrierSize(0) (layout.js:1220-1221).
 const HOT_EDGE_WIDTH_FRACTION = 1 / 3;
 const PLACEHOLDER_WIDTH = 24;
+const PLACEHOLDER_MARGIN = 12;
+// How far the row parts around the placeholder.
+const ROW_GAP_WIDTH = PLACEHOLDER_WIDTH + 2 * PLACEHOLDER_MARGIN;
+const ROW_GAP_DURATION = 250;
 
 const ZoomOutView = GObject.registerClass({
     Signals: {
@@ -93,15 +97,8 @@ const ZoomOutView = GObject.registerClass({
         // _dropPlaceholder (workspaceThumbnail.js:616). Used to signal
         // "drop here creates a new workspace" in FitMode.ALL.
         //
-        // Ours is an overlay; upstream allocates its placeholder into the row
-        // so the workspaces visibly open a gap. WorkspacesView.vfunc_allocate
-        // advances every workspace by one uniform spacing
-        // (workspacesView.js:373-388), leaving no per-gap room to allocate
-        // into. Translating the actors instead was tried and reverted: the
-        // hit test reads get_transformed_position, so the zone moved with the
-        // animation and escaped the cursor every frame. Doing it properly
-        // needs the fit-all loop to consult a placeholder position the way
-        // ThumbnailsBox does - which is the upstream change worth asking for.
+        // Ours is an overlay; upstream allocates its placeholder into the row.
+        // The room around it comes from _setRowGap.
         this._dropPlaceholder = new St.Bin({
             style_class: 'placeholder',
             visible: false,
@@ -109,18 +106,50 @@ const ZoomOutView = GObject.registerClass({
             x: 0,
             y: 0,
         });
-        this._dropPlaceholderRect = null; // { x, y, w, h } in ZoomOutView local coords
+        this._dropPlaceholder.set_pivot_point(0.5, 0.5);
+        this._placeholderLeaving = false;
+        this._dropPlaceholderRect = null; // { index, x, y, w, h } in ZoomOutView local coords
         this.add_child(this._dropPlaceholder);
     }
 
     setDropPlaceholderRect(rect) {
-        this._dropPlaceholderRect = rect;
+        const ph = this._dropPlaceholder;
         if (rect) {
-            this._dropPlaceholder.visible = true;
+            const prev = this._dropPlaceholderRect;
+            this._dropPlaceholderRect = rect;
             this.queue_relayout();
-        } else {
-            this._dropPlaceholder.visible = false;
+            if (ph.visible && !this._placeholderLeaving &&
+                prev?.index === rect.index)
+                return;
+
+            this._placeholderLeaving = false;
+            ph.remove_all_transitions();
+            ph.set({visible: true, opacity: 0, scale_y: 0});
+            ph.ease({
+                opacity: 255,
+                scale_y: 1,
+                duration: ROW_GAP_DURATION,
+                mode: Clutter.AnimationMode.EASE_OUT_CUBIC,
+            });
+            return;
         }
+
+        if (!ph.visible || this._placeholderLeaving)
+            return;
+        this._placeholderLeaving = true;
+        ph.ease({
+            opacity: 0,
+            scale_y: 0,
+            duration: ROW_GAP_DURATION,
+            mode: Clutter.AnimationMode.EASE_OUT_CUBIC,
+            onStopped: finished => {
+                if (!finished || !this._placeholderLeaving)
+                    return;
+                this._placeholderLeaving = false;
+                ph.hide();
+                this._dropPlaceholderRect = null;
+            },
+        });
     }
 
     show() {
@@ -188,6 +217,7 @@ const ZoomOutView = GObject.registerClass({
             if (rect) {
                 this._extension._dropInsertIndex = insertIndex;
                 this.setDropPlaceholderRect(rect);
+                this._extension._setRowGap(insertIndex);
                 logTime('VIEW.handleDragOver => INSERT',
                     {insertIndex, x, y, rect});
                 return isWindow
@@ -233,6 +263,7 @@ export default class SpatialOverviewExtension extends Extension {
         this._spatialEngaged = false;
         this._dropInsertIndex = -1;
         this._dropWorkspaceIndex = -1;
+        this._rowGapIndex = -1;
         this._sessionModeUpdatedId = 0;
         this._minWorkspacesProto = null;
         this._panelPatched = false;
@@ -313,7 +344,12 @@ export default class SpatialOverviewExtension extends Extension {
         // Returns {scale, wsSize, adjSpacing, margin} where wsSize is the
         // workspace width (horizontal) or height (vertical), and margin is
         // the offset that centers the row.
-        const _computeFitAll = (avail, n, portholeSize, spacing) => {
+        //
+        // reserve is width kept off the row and split between its two ends:
+        // the room _setRowGap parts the row into.
+        const _computeFitAll = (avail, n, portholeSize, spacing, reserve) => {
+            const fullAvail = avail;
+            avail -= reserve;
             // idealScale: the largest scale whose workspaces plus their own
             // proportional gaps still fit, from
             // avail = n * wsSize + (n + 1) * WORKSPACE_GAP_RATIO * wsSize.
@@ -366,10 +402,15 @@ export default class SpatialOverviewExtension extends Extension {
             // steps by wsSize + adjSpacing (workspacesView.js:380-387), so
             // this is the row's real extent.
             const margin = Math.max(
-                (avail - (wsSize * n + adjSpacing * (n - 1))) / 2, 0);
+                (fullAvail - (wsSize * n + adjSpacing * (n - 1))) / 2, 0);
 
             return {scale, wsSize, adjSpacing, margin};
         };
+
+        // The gap only ever opens along a horizontal row, and only where a
+        // drop can create a workspace (_getInsertWorkspaceIndex).
+        const rowGapReserve = vertical =>
+            !vertical && Meta.prefs_get_dynamic_workspaces() ? ROW_GAP_WIDTH : 0;
 
         proto._getSpacing = function (box, fitMode, vertical) {
             if (fitMode !== FitMode.ALL || !self._spatialLayoutActive())
@@ -389,7 +430,7 @@ export default class SpatialOverviewExtension extends Extension {
             const avail = vertical ? height : width;
             const portholeSize = vertical ? portholeH : portholeW;
             const {adjSpacing} = _computeFitAll(avail, nWorkspaces,
-                portholeSize, upstream);
+                portholeSize, upstream, rowGapReserve(vertical));
             return adjSpacing;
         };
 
@@ -412,7 +453,8 @@ export default class SpatialOverviewExtension extends Extension {
             let gap = 0;
             if (vertical) {
                 const {wsSize: wsH, adjSpacing, margin} = _computeFitAll(
-                    height, nWorkspaces, portholeH, spacing);
+                    height, nWorkspaces, portholeH, spacing,
+                    rowGapReserve(vertical));
                 gap = adjSpacing;
                 y1 = margin;
                 const [, wsW] = workspace.get_preferred_width(wsH);
@@ -425,7 +467,8 @@ export default class SpatialOverviewExtension extends Extension {
                 fitAllBox.set_size(width, wsH);
             } else {
                 const {wsSize: wsW, adjSpacing, margin} = _computeFitAll(
-                    width, nWorkspaces, portholeW, spacing);
+                    width, nWorkspaces, portholeW, spacing,
+                    rowGapReserve(vertical));
                 gap = adjSpacing;
                 x1 = margin;
                 const [, wsH] = workspace.get_preferred_height(wsW);
@@ -1169,6 +1212,80 @@ export default class SpatialOverviewExtension extends Extension {
 
         this._dropInsertIndex = -1;
         this._zoomOutView?.setDropPlaceholderRect(null);
+        this._setRowGap(-1);
+    }
+
+    // FIXME downstream: ThumbnailsBox opens room for its placeholder by
+    // allocating it into the row, which pushes every later thumbnail along by
+    // the placeholder's width plus spacing (workspaceThumbnail.js:1373-1398).
+    // WorkspacesView.vfunc_allocate steps every workspace by one uniform
+    // spacing (workspacesView.js:373-388) and a vfunc cannot be replaced from
+    // an extension, so the row parts by translation instead: the workspaces
+    // before the gap move back by half of it and the ones after move on by
+    // half. The layout keeps ROW_GAP_WIDTH off the row (rowGapReserve), so
+    // either half fits in the margin at its end - without it a row that fills
+    // the monitor pushes its end workspaces off screen.
+    //
+    // The hit test reads the row without this translation
+    // (_collectWorkspaceRects), so the zones never move with the animation.
+    //
+    // Ideal upstream fix: let the fit-all loop in vfunc_allocate leave room
+    // at a given index, the way ThumbnailsBox consults _dropPlaceholderPos.
+    _setRowGap(insertIndex) {
+        if (this._rowGapIndex === insertIndex)
+            return;
+        this._rowGapIndex = insertIndex;
+
+        for (const w of this._getFitAllWorkspaces()) {
+            const i = w.metaWorkspace?.index() ?? -1;
+            const offset = insertIndex < 0
+                ? 0
+                : (i >= insertIndex ? 1 : -1) * ROW_GAP_WIDTH / 2;
+            w.ease({
+                translation_x: offset,
+                duration: ROW_GAP_DURATION,
+                mode: Clutter.AnimationMode.EASE_OUT_CUBIC,
+            });
+        }
+    }
+
+    _resetRowGap() {
+        this._rowGapIndex = -1;
+        for (const view of this._getWsDisplay()?._workspacesViews ?? []) {
+            for (const w of view._workspaces ?? []) {
+                w.remove_transition('translation-x');
+                w.translation_x = 0;
+            }
+        }
+    }
+
+    _getFitAllWorkspaces() {
+        const display = this._getWsDisplay();
+        for (const v of display?._workspacesViews ?? []) {
+            if (v?._workspaces?.length > 0)
+                return v._workspaces;
+        }
+        return display?._workspacesView?._workspaces ?? [];
+    }
+
+    // Where a drop past the last workspace goes: the first workspace of the
+    // trailing empty run, the one _checkWorkspaces keeps as the spare
+    // (windowManager.js:283-289). Counted the way it counts
+    // (windowManager.js:254-264) except for the window being dragged: counted,
+    // a window that is already the last one on the row moves one along and
+    // is slid back once collection resumes.
+    _firstTrailingEmptyIndex() {
+        const {nWorkspaces} = global.workspace_manager;
+        let lastOccupied = -1;
+        for (const actor of global.get_window_actors()) {
+            const win = actor.get_meta_window();
+            if (!win || win === this._draggedMetaWindow ||
+                win.is_on_all_workspaces())
+                continue;
+            lastOccupied = Math.max(lastOccupied,
+                win.get_workspace()?.index() ?? -1);
+        }
+        return Math.min(lastOccupied + 1, nWorkspaces - 1);
     }
 
     // _queueUpdateDragHover coalesces onto a single idle (dnd.js:364-372), so
@@ -1776,34 +1893,38 @@ export default class SpatialOverviewExtension extends Extension {
         if (!mon || !view)
             return {rects: [], monitor: null, spacing: 0};
 
-        const display = this._getWsDisplay();
-        let workspaces = null;
-        const views = display?._workspacesViews;
-        if (Array.isArray(views)) {
-            for (const v of views) {
-                if (v?._workspaces && v._workspaces.length > 0) {
-                    workspaces = v._workspaces;
-                    break;
-                }
-            }
-        }
-        const wsView = display?._workspacesView;
-        if (!workspaces && wsView?._workspaces)
-            workspaces = wsView._workspaces;
-        if (!workspaces || workspaces.length === 0)
+        const workspaces = this._getFitAllWorkspaces();
+        if (workspaces.length === 0)
             return {rects: [], monitor: mon, spacing: 0};
 
         const rects = [];
-        for (let i = 0; i < workspaces.length; i++) {
-            const wsActor = workspaces[i];
+        const rendered = [];
+        for (const wsActor of workspaces) {
             if (!wsActor || !wsActor.visible || !wsActor.metaWorkspace)
                 continue;
             const [wx, wy] = wsActor.get_transformed_position();
             const [ww, wh] = wsActor.get_transformed_size();
             if (ww <= 1 || wh <= 1)
                 continue;
-            const [okTL, lx, ly] = view.transform_stage_point(wx, wy);
-            const [okBR, rx, ry] = view.transform_stage_point(wx + ww, wy + wh);
+
+            // The row as the layout placed it, not as it is drawn: without
+            // the accent's scale, which grows the current workspace about its
+            // centre (workspace.js:1041), and without the translation
+            // _setRowGap parts the row with. Both are paint-time transforms,
+            // so the zones measured off the drawn geometry would move under a
+            // still cursor while they animate.
+            const scale = wsActor.scale_x || 1;
+            const ancestorScale = ww / (wsActor.width * scale) || 1;
+            const cx = wx + ww / 2 -
+                wsActor.translation_x * ancestorScale;
+            const cy = wy + wh / 2;
+            const bw = ww / scale;
+            const bh = wh / scale;
+
+            const [okTL, lx, ly] =
+                view.transform_stage_point(cx - bw / 2, cy - bh / 2);
+            const [okBR, rx, ry] =
+                view.transform_stage_point(cx + bw / 2, cy + bh / 2);
             if (!okTL || !okBR)
                 continue;
             rects.push({
@@ -1811,6 +1932,8 @@ export default class SpatialOverviewExtension extends Extension {
                 x: Math.round(lx), y: Math.round(ly),
                 w: Math.round(rx - lx), h: Math.round(ry - ly),
             });
+            if (DEBUG)
+                rendered.push(Math.round(view.transform_stage_point(wx, wy)[1]));
         }
         rects.sort((a, b) => a.i - b.i);
 
@@ -1821,13 +1944,14 @@ export default class SpatialOverviewExtension extends Extension {
             : 0;
 
         if (DEBUG) {
-            const key = rects.map(r => `${r.x}:${r.w}`).join(',');
+            const key = rendered.join(',');
             if (this._rectProbeKey !== key) {
                 this._rectProbeKey = key;
                 logTime('wsRects', JSON.stringify({
                     n: rects.length, spacing,
                     panel: rects[0] ? [rects[0].w, rects[0].h] : null,
                     x: rects.map(r => r.x),
+                    rendered,
                     gaps: rects.slice(1).map(
                         (r, k) => r.x - (rects[k].x + rects[k].w)),
                 }));
@@ -1840,6 +1964,9 @@ export default class SpatialOverviewExtension extends Extension {
     // The horizontal cut mirrors upstream _withinWorkspace
     // (workspaceThumbnail.js:819-834): the outer WORKSPACE_CUT_SIZE of each
     // workspace belongs to the neighbouring insert zone, not to the workspace.
+    // The last workspace keeps its outer edge, as upstream's does
+    // (workspaceThumbnail.js:826-831), and past it the drop goes to the spare
+    // workspace at the end of the row (_firstTrailingEmptyIndex).
     _getWorkspaceIndexAt(x, y) {
         const {rects, monitor} = this._collectWorkspaceRects();
         if (!monitor || rects.length === 0) {
@@ -1848,12 +1975,15 @@ export default class SpatialOverviewExtension extends Extension {
             });
             return -1;
         }
+        const last = rects[rects.length - 1];
         for (const r of rects) {
             // Exclusive lower bound like upstream (workspaceThumbnail.js:833):
             // with >= the boundary pixel is claimed by the insert zone and by
             // this one at the same time.
             const x1 = r.x + WORKSPACE_CUT_SIZE;
-            const x2 = r.x + r.w - WORKSPACE_CUT_SIZE;
+            const x2 = r === last
+                ? r.x + r.w
+                : r.x + r.w - WORKSPACE_CUT_SIZE;
             if (x > x1 && x <= x2 && y >= r.y && y <= r.y + r.h) {
                 logTime('_getWorkspaceIndexAt: HIT', {
                     wsIndex: r.i,
@@ -1863,6 +1993,14 @@ export default class SpatialOverviewExtension extends Extension {
                 return r.i;
             }
         }
+
+        if (Meta.prefs_get_dynamic_workspaces() &&
+            x > last.x + last.w && y >= last.y && y <= last.y + last.h) {
+            const spare = this._firstTrailingEmptyIndex();
+            logTime('_getWorkspaceIndexAt: past the last -> spare', {spare});
+            return spare;
+        }
+
         logTime('_getWorkspaceIndexAt: MISS', {
             x: Math.round(x), y: Math.round(y),
             rects,
@@ -1882,13 +2020,14 @@ export default class SpatialOverviewExtension extends Extension {
     // Zone geometry follows _getPlaceholderTarget (workspaceThumbnail.js:786):
     // the zone before workspace k spans [k.x - spacing - CUT, k.x + CUT], so it
     // eats into both neighbours instead of being only the bare gap, and it
-    // widens by the placeholder's footprint once engaged there.
+    // widens to the gap _setRowGap opens once engaged there, as upstream
+    // widens by the placeholder's footprint (workspaceThumbnail.js:808-814).
+    // The zone before the first workspace takes the whole margin in front of
+    // the row.
     //
-    // The widening is not optional padding: upstream allocates the placeholder
-    // into the row, which pushes the workspace right by exactly that much, and
-    // the term is what keeps the zone under the cursor afterwards. Any attempt
-    // to add the reflow here has to keep it, or the zone escapes the cursor,
-    // clears, and re-engages every frame.
+    // No insert-after-last zone, as upstream has none
+    // (workspaceThumbnail.js:851-862): the spare workspace at the end already
+    // is the new workspace, see _getWorkspaceIndexAt.
     _getInsertWorkspaceIndex(x, y) {
         if (!Meta.prefs_get_dynamic_workspaces())
             return -1;
@@ -1906,63 +2045,41 @@ export default class SpatialOverviewExtension extends Extension {
         const engaged = this._dropInsertIndex;
         for (let k = 0; k < rects.length; k++) {
             const r = rects[k];
-            let x1 = r.x - spacing - WORKSPACE_CUT_SIZE;
-            const x2 = r.x + WORKSPACE_CUT_SIZE;
-            // Nothing to the left of the first workspace to cut into.
-            if (k === 0)
-                x1 += spacing + WORKSPACE_CUT_SIZE;
-            if (r.i === engaged)
-                x1 -= PLACEHOLDER_WIDTH + spacing;
+            let x1 = k === 0 ? -Infinity : r.x - spacing - WORKSPACE_CUT_SIZE;
+            let x2 = r.x + WORKSPACE_CUT_SIZE;
+            if (r.i === engaged) {
+                x1 -= ROW_GAP_WIDTH / 2;
+                x2 += ROW_GAP_WIDTH / 2;
+            }
             if (x > x1 && x <= x2)
                 return r.i;
         }
-
-        // FIXME downstream: upstream has no insert-after-last zone - its loop
-        // only builds insert-before zones (workspaceThumbnail.js:851-862).
-        const last = rects[rects.length - 1];
-        let afterX1 = last.x + last.w - WORKSPACE_CUT_SIZE;
-        if (last.i + 1 === engaged)
-            afterX1 -= PLACEHOLDER_WIDTH + spacing;
-        if (x > afterX1)
-            return last.i + 1;
 
         return -1;
     }
 
     // Returns the rect for the placeholder when the insert cursor is at
-    // `insertIndex`, centered in the gap between workspace panels.
+    // `insertIndex`: centred in the gap _setRowGap opens, which is centred on
+    // the gap between the two workspaces - before the first one, on where
+    // that gap would be.
     //
     // FIXME downstream: upstream sizes the placeholder from its theme node via
     // allocate_preferred_size (workspaceThumbnail.js:1348). That size is meant
     // for thumbnails; against full-size FitMode.ALL workspaces we pick the height
     // from the workspace instead.
     _getInsertRect(insertIndex) {
-        const {rects} = this._collectWorkspaceRects();
+        const {rects, spacing} = this._collectWorkspaceRects();
         if (rects.length === 0)
             return null;
         const PH_W = PLACEHOLDER_WIDTH;
         const PH_H = Math.round(rects[0].h / 3);
-        if (insertIndex <= rects[0].i) {
-            const wsH = rects[0].h;
-            const centerY = rects[0].y + wsH / 2;
+        const y = Math.round(rects[0].y + rects[0].h / 2 - PH_H / 2);
+
+        if (insertIndex === rects[0].i) {
             return {
-                index: rects[0].i,
-                x: rects[0].x - PH_W / 2,
-                y: Math.round(centerY - PH_H / 2),
-                w: PH_W,
-                h: PH_H,
-            };
-        }
-        const last = rects[rects.length - 1];
-        if (insertIndex > last.i) {
-            const wsH = last.h;
-            const centerY = last.y + wsH / 2;
-            return {
-                index: last.i + 1,
-                x: last.x + last.w - PH_W / 2,
-                y: Math.round(centerY - PH_H / 2),
-                w: PH_W,
-                h: PH_H,
+                index: insertIndex,
+                x: Math.round(rects[0].x - spacing / 2 - PH_W / 2),
+                y, w: PH_W, h: PH_H,
             };
         }
         for (let k = 0; k < rects.length - 1; k++) {
@@ -1970,14 +2087,10 @@ export default class SpatialOverviewExtension extends Extension {
             const right = rects[k + 1];
             if (insertIndex === right.i) {
                 const gapCenterX = (left.x + left.w + right.x) / 2;
-                const wsH = left.h;
-                const centerY = left.y + wsH / 2;
                 return {
-                    index: right.i,
+                    index: insertIndex,
                     x: Math.round(gapCenterX - PH_W / 2),
-                    y: Math.round(centerY - PH_H / 2),
-                    w: PH_W,
-                    h: PH_H,
+                    y, w: PH_W, h: PH_H,
                 };
             }
         }
@@ -2212,6 +2325,7 @@ export default class SpatialOverviewExtension extends Extension {
 
     _restoreWorkspacesState() {
         this._unblockWorkspaceCollection();
+        this._resetRowGap();
         this._reattachDetachedSlots();
         const ws = this._getWsDisplay();
         for (const view of ws?._workspacesViews ?? []) {
