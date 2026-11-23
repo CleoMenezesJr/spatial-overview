@@ -1549,12 +1549,16 @@ export default class SpatialOverviewExtension extends Extension {
     //
     // Ideal upstream fix: block updates for the duration of any overview drag,
     // not only for the switcher popup.
+    //
+    // Through Main.wm and not the tracker: the tracker's own flag is a plain
+    // boolean (windowManager.js:213-219), so taking it directly would let the
+    // first of us to unblock release the other's hold. Main.wm counts the
+    // holders (windowManager.js:1070-1096).
     _blockWorkspaceCollection() {
-        const tracker = Main.wm?._workspaceTracker;
-        if (!tracker || this._workspaceCollectionBlocked)
+        if (this._workspaceCollectionBlocked || !Main.wm?._workspaceTracker)
             return;
 
-        tracker.blockUpdates();
+        Main.wm.blockWorkspaceUpdates();
         this._workspaceCollectionBlocked = true;
     }
 
@@ -1566,7 +1570,7 @@ export default class SpatialOverviewExtension extends Extension {
         // The check the block deferred is still queued: _queueCheckWorkspaces
         // returns SOURCE_CONTINUE while paused (windowManager.js:231-233), so
         // it runs itself once this clears.
-        Main.wm?._workspaceTracker?.unblockUpdates();
+        Main.wm.unblockWorkspaceUpdates();
     }
 
     // Owned by the layout manager, so a preview that is destroyed or a
