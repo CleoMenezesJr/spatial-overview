@@ -13,7 +13,7 @@ import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as DND from 'resource:///org/gnome/shell/ui/dnd.js';
 import {FitMode, WorkspacesView} from 'resource:///org/gnome/shell/ui/workspacesView.js';
-import {ControlsState} from 'resource:///org/gnome/shell/ui/overviewControls.js';
+import {ControlsState, SMALL_WORKSPACE_RATIO} from 'resource:///org/gnome/shell/ui/overviewControls.js';
 import {HotCorner, MonitorConstraint} from 'resource:///org/gnome/shell/ui/layout.js';
 import {WindowPreview} from 'resource:///org/gnome/shell/ui/windowPreview.js';
 import {Workspace, WorkspaceLayout} from 'resource:///org/gnome/shell/ui/workspace.js';
@@ -29,7 +29,9 @@ const ZOOM_IN_DURATION = 400;
 // animation queued behind it.
 const ZOOM_IN_ACTIVATE_DURATION = 200;
 const ZOOM_OUT_HOLD_DELAY = 150;
-const MIN_WS_SCALE = 0.18;
+// The size the app grid draws the workspaces at: SMALL_WORKSPACE_RATIO of
+// the overview's height (overviewControls.js:22, 104-106).
+const MIN_WS_SCALE = SMALL_WORKSPACE_RATIO;
 // Upstream emphasises the current workspace by shrinking every other one to
 // WORKSPACE_INACTIVE_SCALE (0.94, workspacesView.js:25). Same 6% difference,
 // anchored the other way round: the row sits at 1 and the current one grows,
@@ -81,9 +83,16 @@ const ROW_GAP_DURATION = 200;
 const ROW_GAP_DELAY = 80;
 // Bumping the pointer against the monitor edge scrolls the row by one
 // workspace and repeats while it stays there - the app grid's page switch
-// (appDisplay.js:50-53, 850-899) with its timing (iconGrid.js:13).
+// (appDisplay.js:850-899), with the page's scroll time (iconGrid.js:13).
 const ROW_BUMP_THRESHOLD = 20;
-const ROW_BUMP_REPEAT_TIMEOUT = 1000;
+// The app grid repeats every DRAG_PAGE_SWITCH_REPEAT_TIMEOUT (1000ms,
+// appDisplay.js:53); a workspace is a much smaller step than a page, and
+// held at the edge that read as a long wait between scrolls in testing.
+const ROW_BUMP_REPEAT_TIMEOUT = 400;
+// HOT_CORNER_PRESSURE_THRESHOLD and HOT_CORNER_PRESSURE_TIMEOUT
+// (layout.js:24-25): the push that takes a drag through a row barrier.
+const ROW_BARRIER_THRESHOLD = 100;
+const ROW_BARRIER_TIMEOUT = 1000;
 const ROW_SCROLL_DURATION = 300;
 // How long a dragged file rests on a window before it is activated
 // (overview.js:22).
@@ -230,7 +239,19 @@ class ZoomOutView extends St.Widget {
     show() {
         logTime('VIEW.show start (zoom-out)');
         this._removeHideTimeout();
+        this._resetDropPlaceholder();
         this.visible = true;
+    }
+
+    // Each engage starts without a placeholder, whatever the last drag's
+    // fade left: one was seen in testing on a fresh engage, inside a
+    // workspace, with no gap hovered.
+    _resetDropPlaceholder() {
+        const ph = this._dropPlaceholder;
+        ph.remove_all_transitions();
+        ph.set({visible: false, opacity: 255, scale_y: 1});
+        this._placeholderLeaving = false;
+        this._dropPlaceholderRect = null;
     }
 
     hide() {
@@ -241,6 +262,7 @@ class ZoomOutView extends St.Widget {
                 this._hideTimeoutId = 0;
                 logTime('VIEW.hide onComplete (zoom-in DONE)');
                 this.visible = false;
+                this._resetDropPlaceholder();
                 return GLib.SOURCE_REMOVE;
             });
     }
@@ -355,6 +377,7 @@ export default class SpatialOverviewExtension extends Extension {
         this._rowScrollAdj = null;
         this._rowBumpTimeoutId = 0;
         this._rowBumpX = -1;
+        this._rowBarriers = null;
         this._rowWsW = 0;
         this._rowN = 0;
         this._rowWidth = 0;
@@ -580,6 +603,7 @@ export default class SpatialOverviewExtension extends Extension {
         this._cancelFileEngage();
         this._resetFileHover();
         this._resetRowBump();
+        this._destroyRowBarriers();
         this._disconnectFitModeNotify();
         // A zoom-in already under way, or one the overview's own leave
         // animation is carrying, is not ours to start again.
@@ -691,9 +715,22 @@ export default class SpatialOverviewExtension extends Extension {
         const origGetSpacing = this._origGetSpacing;
         const self = this;
 
+        // FIXME downstream: with workspaces-only-on-primary off, every
+        // secondary monitor gets a WorkspacesView of its own on the same
+        // fit-mode adjustment (workspacesView.js:742-754), so it goes to
+        // FitMode.ALL with the primary. The row - its scroll, its gaps, its
+        // drop targets - is the primary's alone: the views on other monitors
+        // keep upstream's fit-all layout. Laid out through this patch they
+        // overwrote the primary's scroll state with their own, which stopped
+        // the primary row scrolling, and drew their workspaces overlapping.
+        //
+        // Ideal upstream fix: one row model the views on every monitor read.
+        const isRowView = view =>
+            view._monitorIndex === Main.layoutManager.primaryIndex;
+
         proto._getSpacing = function (box, fitMode, vertical) {
             if (fitMode !== FitMode.ALL || vertical ||
-                !self._spatialLayoutActive())
+                !self._spatialLayoutActive() || !isRowView(this))
                 return origGetSpacing.call(this, box, fitMode, vertical);
 
             const [width] = box.get_size();
@@ -708,7 +745,7 @@ export default class SpatialOverviewExtension extends Extension {
         };
 
         proto._getFirstFitAllWorkspaceBox = function (box, spacing, vertical) {
-            if (vertical || !self._spatialLayoutActive()) {
+            if (vertical || !self._spatialLayoutActive() || !isRowView(this)) {
                 return self._origGetFirstFitAllWorkspaceBox.call(
                     this, box, spacing, vertical);
             }
@@ -801,11 +838,18 @@ export default class SpatialOverviewExtension extends Extension {
         this._origGetWindowSlots = WorkspaceLayout.prototype._getWindowSlots;
         const origGetWindowSlots = this._origGetWindowSlots;
         WorkspaceLayout.prototype._getWindowSlots = function (containerBox) {
-            // A foreign strategy places by proportion, not by row and column,
-            // so it has no spacing of ours to scale.
             if (!self._spatialEngaged || !this._layoutStrategy ||
-                !this._workarea || self._strategyOwnsGeometry(this))
+                !this._workarea)
                 return origGetWindowSlots.call(this, containerBox);
+
+            // A foreign strategy places by proportion, not by row and column,
+            // so it has no spacing of ours to scale - only a box to be kept
+            // inside. This is also the path of every workspace the engage
+            // could not pin, having no slots solved yet (_engageSpatialLayout).
+            if (self._strategyOwnsGeometry(this)) {
+                return self._fitSlotsToBackground(this,
+                    origGetWindowSlots.call(this, containerBox), containerBox);
+            }
 
             const strategy = this._layoutStrategy;
             const scale = Math.min(
@@ -1009,6 +1053,7 @@ export default class SpatialOverviewExtension extends Extension {
         this._removeEngageTimeout();
         this._removeRowGapTimeout();
         this._resetRowBump();
+        this._destroyRowBarriers();
         this._rowScrollAdj?.remove_transition('value');
         this._rowScrollAdj = null;
         this._stopSnapBackRetarget();
@@ -1477,7 +1522,12 @@ export default class SpatialOverviewExtension extends Extension {
         }
         const targetWs = global.workspace_manager.get_workspace_by_index(wsIndex);
         const currentWs = metaWindow.get_workspace();
-        if (currentWs === targetWs) {
+        // A workspace spans every monitor, so a window dragged in from
+        // another monitor can land on its own workspace and still have
+        // somewhere to go: onto the monitor the row is on, as a thumbnail
+        // drop moves it onto the thumbnail's (workspaceThumbnail.js:547-548).
+        const monIndex = Main.layoutManager.primaryIndex;
+        if (currentWs === targetWs && metaWindow.get_monitor() === monIndex) {
             logTime('_handleDrop: same workspace -> skip (no anim)');
             return false;
         }
@@ -1486,12 +1536,13 @@ export default class SpatialOverviewExtension extends Extension {
             to: wsIndex,
             title: metaWindow.get_title?.() ?? '?',
         });
-        const follow = this._dropEmptiesActiveWorkspace(metaWindow);
-        metaWindow.change_workspace(targetWs);
+        const follow = currentWs !== targetWs &&
+            this._dropEmptiesActiveWorkspace(metaWindow);
+        Main.moveWindowToMonitorAndWorkspace(metaWindow, monIndex, wsIndex);
         if (follow)
             this._followDroppedWindow(wsIndex);
         // Don't snap fitModeAdjustment here - _onDragEnd (triggered
-        // synchronously by change_workspace -> window-drag-end signal)
+        // synchronously by the workspace change -> window-drag-end signal)
         // owns the zoom-in ease. Snapping here would remove_transition
         // and set value=FitMode.SINGLE mid-ease, skipping the animation.
         logTime('_handleDrop: change_workspace RETURNED');
@@ -1699,18 +1750,33 @@ export default class SpatialOverviewExtension extends Extension {
 
     // AppDisplay._dragMaybeSwitchPageImmediately (appDisplay.js:850-899) for
     // the fit-all row, scrolling by a workspace where it turns a page, and
-    // repeating while the pointer stays. Like upstream it is off with more
-    // than one monitor, where the same push carries the window to the next
-    // one.
+    // repeating while the pointer stays.
+    //
+    // FIXME downstream: upstream turns the bump off whenever there is more
+    // than one monitor, because the push that turns the page is the one that
+    // carries the drag onto the next monitor (appDisplay.js:851-854). An edge
+    // another monitor touches gets a barrier instead (_ensureRowBarriers),
+    // which stops the pointer there the way the edge of the layout does, so
+    // the bump works the same on every edge; pushing on through the barrier
+    // releases it and the drag goes on to the other monitor.
+    //
+    // Ideal upstream fix: the same barrier in the app grid.
     _maybeScrollRow(x) {
         const mon = Main.layoutManager.primaryMonitor;
-        if (!this._spatialLayoutActive() || !(this._rowOverflow > 0) ||
-            !mon || Main.layoutManager.monitors.length > 1) {
+        if (!this._spatialLayoutActive() || !(this._rowOverflow > 0) || !mon) {
             this._resetRowBump();
             return;
         }
+        this._ensureRowBarriers(mon);
         if (this._rowScrollAdj?.get_transition('value'))
             return;
+
+        // Off the monitor the row is on, the pointer is carrying the drag to
+        // another one: whatever it started at the edge stops there.
+        if (x < mon.x || x >= mon.x + mon.width) {
+            this._resetRowBump();
+            return;
+        }
 
         const start = mon.x + ROW_BUMP_THRESHOLD;
         const end = mon.x + mon.width - ROW_BUMP_THRESHOLD;
@@ -1723,7 +1789,10 @@ export default class SpatialOverviewExtension extends Extension {
         if (this._rowBumpX >= 0)
             return;
 
-        const direction = x <= start ? -1 : 1;
+        this._startRowScroll(x <= start ? -1 : 1, x);
+    }
+
+    _startRowScroll(direction, x) {
         this._scrollRowBy(direction);
         this._resetRowBump();
         this._rowBumpTimeoutId = GLib.timeout_add(
@@ -1732,6 +1801,68 @@ export default class SpatialOverviewExtension extends Extension {
                 return GLib.SOURCE_CONTINUE;
             });
         this._rowBumpX = x;
+    }
+
+    // Whether another monitor touches mon's left (-1) or right (1) edge.
+    _monitorBeyond(mon, direction) {
+        return Main.layoutManager.monitors.some(m => {
+            if (m === mon)
+                return false;
+            const touches = direction < 0
+                ? m.x + m.width === mon.x
+                : m.x === mon.x + mon.width;
+            return touches && m.y < mon.y + mon.height && m.y + m.height > mon.y;
+        });
+    }
+
+    // A barrier on each edge of mon that another monitor touches, blocking
+    // the way out and letting the way back in, as HotCorner's barriers do
+    // (layout.js:1192-1212). Pressure is counted like PressureBarrier's -
+    // HOT_CORNER_PRESSURE_THRESHOLD pixels of push within its timeout
+    // (layout.js:24-25) - but PressureBarrier only reports the push, so the
+    // release that lets the pointer through is done here (Meta.Barrier.release).
+    _ensureRowBarriers(mon) {
+        if (this._rowBarriers)
+            return;
+        this._rowBarriers = [];
+        for (const direction of [-1, 1]) {
+            if (!this._monitorBeyond(mon, direction))
+                continue;
+            const x = direction < 0 ? mon.x : mon.x + mon.width;
+            const barrier = new Meta.Barrier({
+                backend: global.backend,
+                x1: x, x2: x,
+                y1: mon.y, y2: mon.y + mon.height,
+                directions: direction < 0
+                    ? Meta.BarrierDirection.POSITIVE_X
+                    : Meta.BarrierDirection.NEGATIVE_X,
+            });
+            const pressure = {sum: 0, since: 0};
+            barrier.connect('hit', (b, event) => {
+                if (event.time - pressure.since > ROW_BARRIER_TIMEOUT) {
+                    pressure.sum = 0;
+                    pressure.since = event.time;
+                }
+                pressure.sum += Math.abs(event.dx);
+                this._maybeScrollRow(event.x);
+                if (pressure.sum >= ROW_BARRIER_THRESHOLD) {
+                    logTime('row barrier released', {direction});
+                    pressure.sum = 0;
+                    b.release(event);
+                }
+            });
+            barrier.connect('left', () => {
+                pressure.sum = 0;
+            });
+            this._rowBarriers.push(barrier);
+            logTime('row barrier', {direction, x});
+        }
+    }
+
+    _destroyRowBarriers() {
+        for (const barrier of this._rowBarriers ?? [])
+            barrier.destroy();
+        this._rowBarriers = null;
     }
 
     // Where a scroll in `direction` (screen order) lands. Like the app grid,
@@ -1845,6 +1976,7 @@ export default class SpatialOverviewExtension extends Extension {
         }
         this._dragActive = false;
         this._resetRowBump();
+        this._destroyRowBarriers();
         // Connected per engage, so it has to go per drag: the adjustment is the
         // shell's own and outlives us, and the next engage would connect a
         // second handler onto it rather than replace this one.
@@ -2051,6 +2183,27 @@ export default class SpatialOverviewExtension extends Extension {
     // hands the slot back every pass, and the clone flashes at whatever the
     // box means inside Main.uiGroup - the top of the screen - until the next
     // motion event puts it back under the pointer.
+    // A foreign strategy lays its windows out over the whole container box
+    // it is handed, while the background drawn for the workspace sits inside
+    // that box by a margin (_backgroundInset). With mosaicwm's strategy two
+    // maximized windows in neighbouring workspaces were seen covering the
+    // gap between them. Map the container onto the background, the same
+    // mapping _floatWindowSlots uses: the strategy's picture, shrunk into
+    // what is drawn.
+    _fitSlotsToBackground(lm, slots, containerBox) {
+        const w = containerBox.get_width();
+        const h = containerBox.get_height();
+        if (!(w > 0) || !(h > 0))
+            return slots;
+        const [ix, iy] = this._backgroundInset(lm, w);
+        if (!(ix > 0) && !(iy > 0))
+            return slots;
+        const sx = (w - 2 * ix) / w;
+        const sy = (h - 2 * iy) / h;
+        return slots.map(([x, y, sw, sh, child]) =>
+            [ix + x * sx, iy + y * sy, sw * sx, sh * sy, child]);
+    }
+
     _dropDetachedSlots(lm, slots) {
         const container = lm._container;
         if (!container)
@@ -2305,7 +2458,16 @@ export default class SpatialOverviewExtension extends Extension {
         // A fit-all entered with the overview starts on the desktop, which
         // is the floating picture at full size; there is no spread to leave.
         const weight = this._floatFromDesktop ? 1 : this._floatingFitMode();
-        const scale = lm._spatialRefBox.get_width() / workarea.width;
+
+        // Into the drawn background, not the whole container: at the
+        // window-picker state the hook pins, the background sits inside the
+        // Workspace actor by a margin (measured: 20px a side, 12px top and
+        // bottom), while the container fills it. Mapped onto the container,
+        // a window the size of the workarea would reach that margin past
+        // what is drawn.
+        const refW = lm._spatialRefBox.get_width();
+        const [ix, iy] = this._backgroundInset(lm);
+        const scale = (refW - 2 * ix) / workarea.width;
 
         for (const slot of lm._spatialRefSlots) {
             this._trackFloatingGeometry(lm, slot[4]);
@@ -2317,12 +2479,25 @@ export default class SpatialOverviewExtension extends Extension {
                 continue;
 
             const to = [
-                (x - workarea.x) * scale, (y - workarea.y) * scale,
+                ix + (x - workarea.x) * scale, iy + (y - workarea.y) * scale,
                 width * scale, height * scale,
             ];
             for (let i = 0; i < 4; i++)
                 slot[i] = from[i] + (to[i] - from[i]) * weight;
         }
+    }
+
+    // The background's margin inside the container, in the pixels of a box
+    // boxWidth wide laid over the container.
+    _backgroundInset(lm, boxWidth = lm._spatialRefBox.get_width()) {
+        const container = lm._container;
+        const bg = container?.get_parent()?._background;
+        const c = container?.allocation;
+        const g = bg?.allocation;
+        if (!c || !g || !(g.get_width() > 1) || !(c.get_width() > 1))
+            return [0, 0];
+        const k = boxWidth / c.get_width();
+        return [Math.max(g.x1 - c.x1, 0) * k, Math.max(g.y1 - c.y1, 0) * k];
     }
 
     // The app icon and the hover overlay are drawn for the spread and outlive
@@ -2607,6 +2782,15 @@ export default class SpatialOverviewExtension extends Extension {
     // is the new workspace, see _getWorkspaceIndexAt.
     _getInsertWorkspaceIndex(x, y) {
         if (!Meta.prefs_get_dynamic_workspaces())
+            return -1;
+        // The ROW_BUMP_THRESHOLD band at each edge belongs to the scroll
+        // while the row can scroll: where the row happens to stop, a gap can
+        // fall right under it - seen in testing, the gap before the next
+        // workspace sat at x 1261-1285 on a 1280px monitor, so pushing the
+        // edge to scroll opened a new workspace there instead.
+        const width = this._zoomOutView?.width ?? 0;
+        if (this._rowOverflow > 0 &&
+            (x < ROW_BUMP_THRESHOLD || x > width - ROW_BUMP_THRESHOLD))
             return -1;
         const {rects, rtl} = this._collectWorkspaceRects();
         if (!this._withinRow(rects, y))
